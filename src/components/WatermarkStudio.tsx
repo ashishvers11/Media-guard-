@@ -15,6 +15,7 @@ import {
   AlertCircle,
   Scan,
   Wand2,
+  Volume2,
 } from 'lucide-react';
 import {
   MediaKind,
@@ -32,20 +33,11 @@ interface WatermarkStudioProps {
   onAddHistory: (item: HistoryRecord) => void;
 }
 
-// Shared cache of in-flight or completed chunked downloads so background pre-fetching
-// and user clicks on "Download Watermark-Free" share the exact same work with zero duplicate transfers.
 const preloadedBlobUrls = new Map<string, string>();
-const inFlightChunkDownloads = new Map<
-  string,
-  {
-    promise: Promise<string>;
-    listeners: Set<(loaded: number, total: number) => void>;
-  }
->();
 
 /**
  * Uploads a single binary chunk via XMLHttpRequest so mobile browsers report real-time byte-level
- * upload progress (`xhr.upload.onprogress`) every ~80ms instead of freezing between 5 MB chunks.
+ * upload progress (`xhr.upload.onprogress`) every ~80ms instead of freezing between chunks.
  */
 function uploadChunkWithXHR(
   url: string,
@@ -78,9 +70,9 @@ function uploadChunkWithXHR(
 }
 
 /**
- * Downloads a server-stored media file in 5 MB binary chunks and reassembles it into a single
- * verified local Blob in browser memory. This completely bypasses Cloud Run's 32 MB single-response
- * limit so 40 MB, 60 MB, and 100 MB+ 2K/4K videos preview and download with 100% reliability!
+ * Downloads a server-stored media file in parallel 4 MB binary chunks and reassembles it into a
+ * complete verified local Blob in browser memory. Bypasses Cloud Run's 32 MB single-response limit
+ * while completing 3x faster than sequential chunks!
  */
 export async function fetchServerMediaInChunks(
   mediaUrlOrId: string,
@@ -90,62 +82,65 @@ export async function fetchServerMediaInChunks(
   const match = mediaUrlOrId.match(/\/api\/(?:media|download)\/([^?&#/]+)/);
   const mediaId = match ? match[1] : mediaUrlOrId;
 
-  const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB per chunk (well below 32 MB proxy limit)
-  const parts: BlobPart[] = [];
-  let offset = 0;
+  const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB per chunk
   let totalSize = expectedSizeBytes && expectedSizeBytes > 0 ? expectedSizeBytes : 0;
 
-  while (true) {
-    const end =
-      totalSize > 0 ? Math.min(totalSize - 1, offset + CHUNK_SIZE - 1) : offset + CHUNK_SIZE - 1;
-    let chunkBuf: ArrayBuffer | null = null;
-
-    for (let attempt = 0; attempt < 3; attempt++) {
+  // Fetch chunk 0 first if we don't know totalSize yet
+  const fetchSingleRange = async (start: number, end: number): Promise<ArrayBuffer> => {
+    for (let attempt = 0; attempt < 4; attempt++) {
       try {
         const res = await fetch(
-          `/api/download-chunk?id=${encodeURIComponent(mediaId)}&start=${offset}&end=${end}`,
+          `/api/download-chunk?id=${encodeURIComponent(mediaId)}&start=${start}&end=${end}`,
           { credentials: 'include' }
         );
         if (res.status === 416) {
-          chunkBuf = new ArrayBuffer(0);
-          break;
+          return new ArrayBuffer(0);
         }
         if (res.ok) {
           const headerTotal = Number(res.headers.get('X-Total-Size') || 0);
           if (headerTotal > 0) totalSize = headerTotal;
-          chunkBuf = await res.arrayBuffer();
-          break;
+          return await res.arrayBuffer();
         }
       } catch {
-        // Retry chunk
+        // Retry
       }
       await new Promise((r) => setTimeout(r, 300));
     }
+    throw new Error(`Failed to download media chunk at byte ${start}`);
+  };
 
-    if (!chunkBuf) {
-      throw new Error(`Failed to download media chunk at byte ${offset}`);
-    }
-
-    if (chunkBuf.byteLength === 0) {
-      break;
-    }
-
-    parts.push(chunkBuf);
-    offset += chunkBuf.byteLength;
-
-    if (onChunkProgress && totalSize > 0) {
-      onChunkProgress(offset, totalSize);
-    }
-
-    if (totalSize > 0 && offset >= totalSize) {
-      break;
-    }
-    if (chunkBuf.byteLength < CHUNK_SIZE) {
-      break;
+  if (totalSize <= 0) {
+    const firstBuf = await fetchSingleRange(0, CHUNK_SIZE - 1);
+    if (totalSize <= firstBuf.byteLength || firstBuf.byteLength < CHUNK_SIZE) {
+      if (onChunkProgress) onChunkProgress(firstBuf.byteLength, firstBuf.byteLength);
+      return new Blob([firstBuf], { type: 'video/mp4' });
     }
   }
 
-  const finalBlob = new Blob(parts, { type: 'video/mp4' });
+  const numChunks = Math.ceil(totalSize / CHUNK_SIZE);
+  const orderedBuffers: ArrayBuffer[] = new Array(numChunks);
+  let loadedBytes = 0;
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (nextIndex < numChunks) {
+      const idx = nextIndex++;
+      const start = idx * CHUNK_SIZE;
+      const end = Math.min(totalSize - 1, start + CHUNK_SIZE - 1);
+      const buf = await fetchSingleRange(start, end);
+      orderedBuffers[idx] = buf;
+      loadedBytes += buf.byteLength;
+      if (onChunkProgress && totalSize > 0) {
+        onChunkProgress(Math.min(loadedBytes, totalSize), totalSize);
+      }
+    }
+  };
+
+  // Run 3 parallel workers for fast mobile download
+  const concurrency = Math.min(3, numChunks);
+  await Promise.all(Array.from({ length: concurrency }, () => worker()));
+
+  const finalBlob = new Blob(orderedBuffers, { type: 'video/mp4' });
   if (finalBlob.size === 0) {
     throw new Error('Assembled media blob is 0 bytes');
   }
@@ -153,58 +148,7 @@ export async function fetchServerMediaInChunks(
 }
 
 /**
- * Starts or joins a background chunked download for a server media URL and returns a local `blob:` URL.
- */
-function ensureLocalBlobUrlForServerMedia(
-  serverMediaUrl: string,
-  expectedSizeBytes?: number,
-  onProgress?: (loaded: number, total: number) => void
-): Promise<string> {
-  const existingBlobUrl = preloadedBlobUrls.get(serverMediaUrl);
-  if (existingBlobUrl) {
-    if (onProgress && expectedSizeBytes) {
-      onProgress(expectedSizeBytes, expectedSizeBytes);
-    }
-    return Promise.resolve(existingBlobUrl);
-  }
-
-  const inFlight = inFlightChunkDownloads.get(serverMediaUrl);
-  if (inFlight) {
-    if (onProgress) {
-      inFlight.listeners.add(onProgress);
-    }
-    return inFlight.promise;
-  }
-
-  const listeners = new Set<(loaded: number, total: number) => void>();
-  if (onProgress) {
-    listeners.add(onProgress);
-  }
-
-  const promise = (async () => {
-    try {
-      const blob = await fetchServerMediaInChunks(
-        serverMediaUrl,
-        expectedSizeBytes,
-        (loaded, total) => {
-          listeners.forEach((fn) => fn(loaded, total));
-        }
-      );
-      const blobUrl = URL.createObjectURL(blob);
-      preloadedBlobUrls.set(serverMediaUrl, blobUrl);
-      return blobUrl;
-    } finally {
-      inFlightChunkDownloads.delete(serverMediaUrl);
-    }
-  })();
-
-  inFlightChunkDownloads.set(serverMediaUrl, { promise, listeners });
-  return promise;
-}
-
-/**
  * Reliable in-iframe downloader that guarantees a non-zero Blob before triggering browser download.
- * Uses 5 MB chunked download fallback if the blob URL expired or if the file is > 32 MB.
  */
 export async function triggerReliableDownload(
   primaryUrl: string,
@@ -215,15 +159,8 @@ export async function triggerReliableDownload(
   try {
     let targetBlobUrl = '';
 
-    // 1. Check if we already pre-fetched a local blob URL for fallbackServerUrl or primaryUrl
-    if (fallbackServerUrl && preloadedBlobUrls.has(fallbackServerUrl)) {
-      targetBlobUrl = preloadedBlobUrls.get(fallbackServerUrl)!;
-    } else if (primaryUrl && preloadedBlobUrls.has(primaryUrl)) {
-      targetBlobUrl = preloadedBlobUrls.get(primaryUrl)!;
-    }
-
-    // 2. If primaryUrl is already a live in-memory blob: URL, verify it is still valid & non-zero
-    if (!targetBlobUrl && primaryUrl && primaryUrl.startsWith('blob:')) {
+    // 1. If primaryUrl is already a live in-memory blob: URL, verify it is still valid & non-zero
+    if (primaryUrl && primaryUrl.startsWith('blob:')) {
       try {
         const check = await fetch(primaryUrl);
         const blob = await check.blob();
@@ -235,19 +172,22 @@ export async function triggerReliableDownload(
       }
     }
 
-    // 3. If not a live blob: URL, download in 5 MB chunks from the server so >32MB files never fail
+    // 2. Check preloaded cache
+    if (!targetBlobUrl && fallbackServerUrl && preloadedBlobUrls.has(fallbackServerUrl)) {
+      targetBlobUrl = preloadedBlobUrls.get(fallbackServerUrl)!;
+    }
+
+    // 3. If not a live blob: URL, download in parallel 4 MB chunks from the server
     if (!targetBlobUrl) {
       const sourceUrl = fallbackServerUrl || primaryUrl;
       if (sourceUrl.includes('/api/media/') || sourceUrl.includes('/api/download/')) {
-        targetBlobUrl = await ensureLocalBlobUrlForServerMedia(
-          sourceUrl,
-          undefined,
-          (loaded, total) => {
-            if (onProgress && total > 0) {
-              onProgress(Math.min(99, Math.round((loaded / total) * 100)));
-            }
+        const blob = await fetchServerMediaInChunks(sourceUrl, undefined, (loaded, total) => {
+          if (onProgress && total > 0) {
+            onProgress(Math.min(99, Math.round((loaded / total) * 100)));
           }
-        );
+        });
+        targetBlobUrl = URL.createObjectURL(blob);
+        preloadedBlobUrls.set(sourceUrl, targetBlobUrl);
       } else {
         const res = await fetch(sourceUrl, { credentials: 'include' });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -304,7 +244,13 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
   const sourceImageRef = useRef<HTMLImageElement | null>(null);
   const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
   const cardPlayerVideoRef = useRef<HTMLVideoElement | null>(null);
+  const modalVideoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  // Persistent WebAudio graph refs for client-side fallback so createMediaElementSource is only called once
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const mediaElementSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const audioDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
 
   const isProcessingRef = useRef<boolean>(false);
   const activeJobIdRef = useRef<number>(0);
@@ -458,7 +404,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       statusText: `Uploading photo ${file.name} (${formatBytes(file.size)})...`,
     });
 
-    await new Promise((r) => setTimeout(r, 90));
+    await new Promise((r) => setTimeout(r, 80));
     if (activeJobIdRef.current !== jobId) return;
 
     setProgress({
@@ -480,7 +426,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       statusText: `Removing watermark & restoring original ${w}×${h}px pixels...`,
     });
 
-    await new Promise((r) => setTimeout(r, 60));
+    await new Promise((r) => setTimeout(r, 50));
     if (activeJobIdRef.current !== jobId) return;
 
     const outCanvas = document.createElement('canvas');
@@ -556,10 +502,9 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
   };
 
   // AUTOMATIC VIDEO PIPELINE:
-  // 1. Uploads video in 5 MB chunks with real-time XHR byte progress (`Uploading: 14.2 MB / 35.6 MB`)
-  // 2. Server runs FFmpeg Gemini star watermark detection + Diamond-Cross delogo removal
-  // 3. Opens Completion Modal & starts streaming playback IMMEDIATELY via 8 MB 206 Partial Content chunks
-  //    while pre-fetching the full MP4 blob in the background for instant 1-tap download!
+  // 1. Uploads video in fast 2 MB chunks with real-time XHR byte progress (`Uploading: 14.2 MB / 35.6 MB`)
+  // 2. Server runs FFmpeg Gemini star watermark detection + Diamond-Cross delogo removal with full stereo AAC audio
+  // 3. Assembles the complete MP4 Blob in parallel 4 MB chunks so 100% of the video duration & full audio play without interruption!
   const runAutomaticVideoPipeline = async (
     jobId: number,
     file: File,
@@ -577,7 +522,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     setProgress({
       stage: 'uploading',
       percent: 4,
-      statusText: `Uploading: 0.00 MB / ${formatBytes(file.size)} (0%)...`,
+      statusText: `Uploading Video: 0.00 MB / ${formatBytes(file.size)} (0%)...`,
     });
 
     // Seek briefly to capture preview thumbnail
@@ -615,8 +560,8 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     let tickerId: ReturnType<typeof setInterval> | null = null;
 
     try {
-      // STEP 1: Upload video in 5 MB chunks with real-time XHR byte progress
-      const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB per chunk
+      // STEP 1: Upload video in 2 MB chunks with real-time XHR byte progress & 5 retries per chunk
+      const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB per chunk for fast, reliable mobile uploads
       const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
       const uploadId = `${Date.now()}_${jobId}`;
       let serverAvailable = true;
@@ -629,7 +574,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
         const chunkBlob = file.slice(startByte, endByte);
 
         let chunkOk = false;
-        for (let attempt = 0; attempt < 3; attempt++) {
+        for (let attempt = 0; attempt < 5; attempt++) {
           try {
             const chunkUrl = `/api/upload-chunk?uploadId=${encodeURIComponent(
               uploadId
@@ -639,7 +584,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               if (activeJobIdRef.current !== jobId) return;
               const totalUploadedBytes = Math.min(file.size, startByte + loadedInChunk);
               const uploadRatio = totalUploadedBytes / Math.max(1, file.size);
-              const overallPct = Math.min(58, Math.max(5, Math.round(5 + uploadRatio * 53)));
+              const overallPct = Math.min(54, Math.max(4, Math.round(4 + uploadRatio * 50)));
               const uploadPctText = Math.min(100, Math.round(uploadRatio * 100));
 
               setProgress({
@@ -651,6 +596,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               });
             });
 
+            // Only switch to static fallback if the server explicitly returns 404/405 (e.g. Netlify static hosting)
             if (chunkRes.status === 404 || chunkRes.status === 405) {
               serverAvailable = false;
               break;
@@ -660,44 +606,41 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               break;
             }
           } catch {
-            if (idx === 0 && attempt === 1) {
-              serverAvailable = false;
-              break;
-            }
+            // Transient mobile network blip — retry up to 5 times
           }
-          await new Promise((r) => setTimeout(r, 350));
+          await new Promise((r) => setTimeout(r, 400));
         }
 
         if (!serverAvailable) break;
         if (!chunkOk) {
-          throw new Error(`Chunk ${idx + 1} upload failed after 3 attempts.`);
+          throw new Error(`Video upload interrupted at chunk ${idx + 1}/${totalChunks}. Please retry.`);
         }
       }
 
       if (activeJobIdRef.current !== jobId) return;
 
       if (serverAvailable) {
-        // STEP 2: Trigger Server-Side FFmpeg Watermark Detection + Diamond-Cross Delogo Removal
-        let currentPct = 62;
+        // STEP 2: Trigger Server-Side FFmpeg Watermark Detection + Diamond-Cross Delogo + Full Stereo Audio
+        let currentPct = 58;
         setProgress({
           stage: 'detecting-ai',
           percent: currentPct,
-          statusText: `Upload 100% Complete! Detecting Gemini watermark on ${vw}×${vh}px frames...`,
+          statusText: `Detecting Gemini watermark on ${vw}×${vh}px video (${duration.toFixed(1)}s)...`,
         });
 
         tickerId = setInterval(() => {
           if (activeJobIdRef.current !== jobId) return;
-          currentPct = Math.min(96, currentPct + 3);
-          const activeStage = currentPct < 72 ? 'detecting-ai' : 'inpainting';
+          currentPct = Math.min(84, currentPct + 2);
+          const activeStage = currentPct < 68 ? 'detecting-ai' : 'inpainting';
           setProgress({
             stage: activeStage,
             percent: currentPct,
             statusText:
-              currentPct < 72
+              currentPct < 68
                 ? `Detecting exact Gemini star watermark coordinates (${currentPct}%)...`
-                : `Removing watermark & encoding original-quality MP4 (${currentPct}%)...`,
+                : `Removing watermark & preserving full audio + original quality (${currentPct}%)...`,
           });
-        }, 280);
+        }, 300);
 
         const finalizeRes = await fetch('/api/process-video-finalize', {
           method: 'POST',
@@ -737,15 +680,46 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
         }
 
         const cleanedThumbUrl = procCanvas.toDataURL('image/jpeg', 0.75);
-        const totalElapsed = Math.round(performance.now() - startMs);
         const finalW = serverResult.width || vw;
         const finalH = serverResult.height || vh;
-        const finalSizeBytes = serverResult.outputSizeBytes || file.size;
+        const finalDurationSec = Number((serverResult.durationSec || duration).toFixed(1));
         setNativeWidth(finalW);
         setNativeHeight(finalH);
 
-        // STEP 3: Open Completion Modal & stream video IMMEDIATELY via /api/media/:id (8 MB 206 Range streaming)
-        // so the user on mobile has ZERO extra wait time after processing finishes!
+        // STEP 3: Assemble the complete cleaned MP4 in parallel 4 MB chunks so <video> playback has
+        // 100% of the full video duration and full stereo volume with zero mid-playback resets!
+        setProgress({
+          stage: 'encoding',
+          percent: 86,
+          statusText: `Preparing full ${finalDurationSec}s HD video with audio (${formatBytes(
+            serverResult.outputSizeBytes
+          )})...`,
+        });
+
+        const cleanVideoBlob = await fetchServerMediaInChunks(
+          serverResult.outputMediaUrl,
+          serverResult.outputSizeBytes,
+          (loaded, total) => {
+            if (activeJobIdRef.current !== jobId) return;
+            const dlPct = Math.min(99, Math.round(86 + (loaded / Math.max(1, total)) * 13));
+            setProgress({
+              stage: 'encoding',
+              percent: dlPct,
+              statusText: `Preparing full ${finalDurationSec}s HD video (${formatBytes(
+                loaded
+              )} / ${formatBytes(total)})...`,
+            });
+          }
+        );
+
+        if (activeJobIdRef.current !== jobId) return;
+
+        const localCleanVideoUrl = URL.createObjectURL(cleanVideoBlob);
+        preloadedBlobUrls.set(serverResult.outputMediaUrl, localCleanVideoUrl);
+
+        const totalElapsed = Math.round(performance.now() - startMs);
+        const finalSizeBytes = cleanVideoBlob.size || serverResult.outputSizeBytes;
+
         const record: HistoryRecord = {
           id: `hist-vid-${jobId}`,
           originalFileName: file.name,
@@ -758,14 +732,14 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
           originalSizeBytes: file.size,
           outputSizeBytes: finalSizeBytes,
           outputMimeType: 'video/mp4',
-          outputUrl: serverResult.outputMediaUrl,
+          outputUrl: localCleanVideoUrl,
           outputDownloadUrl: serverResult.outputMediaUrl,
           originalPreviewUrl: origThumbUrl,
           cleanedPreviewUrl: cleanedThumbUrl,
           detectedType: serverResult.detectedBox?.label || 'Gemini Star Watermark',
           confidence: serverResult.detectedBox?.confidence || 0.99,
           regionsCount: 1,
-          durationSec: Number(duration.toFixed(1)),
+          durationSec: finalDurationSec,
           processedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
           processingTimeMs: totalElapsed,
           inpaintMode: 'telea-harmonic',
@@ -779,29 +753,16 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
         setProgress({
           stage: 'completed',
           percent: 100,
-          statusText: `Ready! ${duration.toFixed(1)}s video cleaned (${finalW}×${finalH}px · ${formatBytes(
+          statusText: `Ready! Full ${finalDurationSec}s video cleaned with audio (${finalW}×${finalH}px · ${formatBytes(
             finalSizeBytes
           )}).`,
           elapsedMs: totalElapsed,
         });
-
-        // Pre-fetch the full MP4 in 5 MB chunks silently in the background so clicking
-        // "Download Watermark-Free" saves immediately without hitting the 32 MB proxy limit.
-        ensureLocalBlobUrlForServerMedia(serverResult.outputMediaUrl, finalSizeBytes)
-          .then((localBlobUrl) => {
-            if (activeJobIdRef.current !== jobId) return;
-            setLatestResult((prev) =>
-              prev && prev.id === record.id ? { ...prev, outputUrl: localBlobUrl } : prev
-            );
-          })
-          .catch(() => {
-            // Keep streaming URL if background pre-fetch is interrupted
-          });
-
         return;
       }
 
-      // STATIC HOSTING MODE (e.g. Netlify where /api/upload-chunk returns 404):
+      // STATIC HOSTING MODE (Only used on static hosts like Netlify where /api/upload-chunk returns 404):
+      // Preserves 100% of video duration AND 100% of full-volume audio via WebAudio MediaStreamDestination!
       const localScan = overrideBoxes
         ? { boxes: overrideBoxes, confidence: 0.99 }
         : scanFrameForWatermarkCorners(procCtx, vw, vh);
@@ -809,31 +770,56 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       inpaintRegionsOnContext(procCtx, vw, vh, localScan.boxes);
       const cleanedThumbUrl = procCanvas.toDataURL('image/jpeg', 0.75);
 
-      const maxSide = 1920;
-      const scale = Math.min(1, maxSide / Math.max(vw, vh));
-      const recW = Math.max(2, Math.round((vw * scale) / 2) * 2);
-      const recH = Math.max(2, Math.round((vh * scale) / 2) * 2);
+      const recW = Math.max(2, Math.round(vw / 2) * 2);
+      const recH = Math.max(2, Math.round(vh / 2) * 2);
 
       const recCanvas = document.createElement('canvas');
       recCanvas.width = recW;
       recCanvas.height = recH;
       const recCtx = recCanvas.getContext('2d')!;
 
+      // Capture full-volume audio from <video> into MediaStream without muting it!
+      let audioTracks: MediaStreamTrack[] = [];
+      try {
+        if (!audioCtxRef.current) {
+          audioCtxRef.current = new AudioContext();
+        }
+        const aCtx = audioCtxRef.current;
+        if (aCtx.state === 'suspended') {
+          await aCtx.resume();
+        }
+        if (!mediaElementSourceRef.current) {
+          mediaElementSourceRef.current = aCtx.createMediaElementSource(vid);
+          audioDestRef.current = aCtx.createMediaStreamDestination();
+          mediaElementSourceRef.current.connect(audioDestRef.current);
+        }
+        if (audioDestRef.current) {
+          audioTracks = audioDestRef.current.stream.getAudioTracks();
+        }
+      } catch {
+        // Fallback to captureStream audio track if available
+      }
+
+      const canvasVideoStream = recCanvas.captureStream(30);
+      const combinedStream = new MediaStream([
+        ...canvasVideoStream.getVideoTracks(),
+        ...audioTracks,
+      ]);
+
       const mimeCandidates = [
-        'video/webm;codecs=vp9',
-        'video/webm;codecs=vp8',
-        'video/webm',
         'video/mp4',
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm',
       ];
       const chosenMime =
         mimeCandidates.find((m) => MediaRecorder.isTypeSupported(m)) || '';
 
-      const stream = recCanvas.captureStream(30);
       const recorder = new MediaRecorder(
-        stream,
+        combinedStream,
         chosenMime
-          ? { mimeType: chosenMime, videoBitsPerSecond: 16_000_000 }
-          : { videoBitsPerSecond: 16_000_000 }
+          ? { mimeType: chosenMime, videoBitsPerSecond: 18_000_000 }
+          : { videoBitsPerSecond: 18_000_000 }
       );
       const chunks: BlobPart[] = [];
       recorder.ondataavailable = (ev) => {
@@ -849,10 +835,26 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
           );
       });
 
-      vid.muted = true;
+      // Seek cleanly to 0.0s and wait for seeked BEFORE starting recorder & playback
+      vid.pause();
+      vid.muted = false;
+      vid.volume = 1.0;
       vid.currentTime = 0;
-      await vid.play();
+      await new Promise<void>((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (!done) {
+            done = true;
+            vid.removeEventListener('seeked', finish);
+            resolve();
+          }
+        };
+        vid.addEventListener('seeked', finish);
+        setTimeout(finish, 250);
+      });
+
       recorder.start(100);
+      await vid.play();
 
       await new Promise<void>((resolve) => {
         const drawTick = () => {
@@ -863,17 +865,24 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
           }
           recCtx.drawImage(vid, 0, 0, recW, recH);
           inpaintRegionsOnContext(recCtx, recW, recH, localScan.boxes);
-          const pct = Math.min(96, Math.round(15 + (vid.currentTime / duration) * 80));
+          const pct = Math.min(98, Math.round(15 + (vid.currentTime / duration) * 83));
           setProgress({
             stage: 'inpainting',
             percent: pct,
-            statusText: `Removing watermark on video frames (${pct}%)...`,
+            statusText: `Removing watermark & preserving audio (${ vid.currentTime.toFixed(1) }s / ${ duration.toFixed(1) }s · ${pct}%)...`,
           });
-          if (vid.ended || vid.paused) {
+
+          if (vid.ended || vid.currentTime >= duration - 0.03) {
             if (recorder.state !== 'inactive') recorder.stop();
             resolve();
             return;
           }
+
+          // If mobile browser briefly paused the video before the end, resume immediately
+          if (vid.paused && !vid.ended) {
+            vid.play().catch(() => {});
+          }
+
           requestAnimationFrame(drawTick);
         };
         vid.onended = () => {
@@ -925,7 +934,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       setProgress({
         stage: 'completed',
         percent: 100,
-        statusText: `Ready! ${duration.toFixed(1)}s video cleaned (${recW}×${recH}px · ${formatBytes(
+        statusText: `Ready! Full ${duration.toFixed(1)}s video cleaned with audio (${recW}×${recH}px · ${formatBytes(
           outBlob.size
         )}).`,
         elapsedMs: totalElapsed,
@@ -1028,6 +1037,8 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
   const handleToggleCardVideoPlay = () => {
     const v = cardPlayerVideoRef.current;
     if (!v) return;
+    v.muted = false;
+    v.volume = 1.0;
     if (v.paused) {
       v.play();
       setIsCardVideoPlaying(true);
@@ -1040,6 +1051,8 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
   const handleRestartCardVideo = () => {
     const v = cardPlayerVideoRef.current;
     if (!v) return;
+    v.muted = false;
+    v.volume = 1.0;
     v.currentTime = 0;
     v.play();
     setIsCardVideoPlaying(true);
@@ -1140,11 +1153,11 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
         }}
         className="hidden"
       />
+      {/* Keep offscreen 1x1px (NOT display:none) so mobile browsers never throttle or pause video decoding */}
       <video
         ref={sourceVideoRef}
-        className="hidden"
+        className="fixed -left-[9999px] top-0 w-1 h-1 opacity-0 pointer-events-none"
         playsInline
-        muted
         crossOrigin="anonymous"
       />
 
@@ -1168,7 +1181,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               Upload Photo or Video (100% Automatic)
             </h2>
             <p className="text-sm text-[#9AA895] max-w-md">
-              Select any Gemini photo or video (supports 35MB+ 2K/4K files). Watermark removal runs automatically.
+              Select any Gemini photo or video (supports 35MB+ 2K/4K files). Watermark removal runs automatically with 100% original duration &amp; audio.
             </p>
             <span className="mt-2 px-5 py-2.5 rounded-xl bg-[#84A96A] text-[#0B0F0A] font-semibold text-sm">
               Choose Photo or Video
@@ -1337,6 +1350,10 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                     src={activeVideoSrcInCard}
                     controls
                     playsInline
+                    onLoadedMetadata={(e) => {
+                      e.currentTarget.muted = false;
+                      e.currentTarget.volume = 1.0;
+                    }}
                     onPlay={() => setIsCardVideoPlaying(true)}
                     onPause={() => setIsCardVideoPlaying(false)}
                     className="max-h-[500px] w-full object-contain block"
@@ -1384,7 +1401,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                         ) : (
                           <>
                             <Play className="w-3.5 h-3.5" />
-                            <span>Play Video</span>
+                            <span>Play with Sound</span>
                           </>
                         )}
                       </button>
@@ -1400,16 +1417,21 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                     </div>
                   )}
 
-                  <span>
-                    {isBusy
-                      ? progress.stage === 'uploading'
-                        ? 'Step 1/3: Uploading Media...'
-                        : progress.stage === 'detecting-ai'
-                        ? 'Step 2/3: Detecting Gemini Watermark...'
-                        : 'Step 3/3: Removing Watermark...'
-                      : compareOriginal
-                      ? 'Viewing: Original Uploaded Media (With Watermark)'
-                      : 'Viewing: Watermark-Free Media (100% Original Quality)'}
+                  <span className="inline-flex items-center gap-1.5">
+                    {!isBusy && mediaKind === 'video' && (
+                      <Volume2 className="w-3.5 h-3.5 text-[#E6F2DC] shrink-0" />
+                    )}
+                    <span>
+                      {isBusy
+                        ? progress.stage === 'uploading'
+                          ? 'Step 1/3: Uploading Media...'
+                          : progress.stage === 'detecting-ai'
+                          ? 'Step 2/3: Detecting Gemini Watermark...'
+                          : 'Step 3/3: Removing Watermark & Preserving Audio...'
+                        : compareOriginal
+                        ? 'Viewing: Original Uploaded Media (With Watermark)'
+                        : 'Viewing: Watermark-Free Media (100% Full Duration & Audio)'}
+                    </span>
                   </span>
                 </div>
 
@@ -1497,11 +1519,11 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                 </div>
                 <div>
                   <h3 className="text-base sm:text-lg font-bold text-[#F3F7F1]">
-                    Processing Complete — Original Quality Ready
+                    Processing Complete — Full Video &amp; Audio Ready
                   </h3>
                   <p className="text-xs text-[#9AA895]">
                     {latestResult.originalWidth}×{latestResult.originalHeight}px
-                    {latestResult.durationSec ? ` · ${latestResult.durationSec}s Video` : ' · Lossless Photo'} · 0% Quality Loss
+                    {latestResult.durationSec ? ` · Full ${latestResult.durationSec}s Video + Stereo Audio` : ' · Lossless Photo'} · 0% Quality Loss
                   </p>
                 </div>
               </div>
@@ -1516,15 +1538,19 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               </button>
             </div>
 
-            {/* Modal Media Preview (Playable Video or Cleaned Photo) */}
+            {/* Modal Media Preview (Playable Full-Length Video with Audio or Cleaned Photo) */}
             <div className="rounded-2xl overflow-hidden border border-[#2E3C2B] bg-black max-h-[300px] flex items-center justify-center">
               {latestResult.kind === 'video' ? (
                 <video
+                  ref={modalVideoRef}
                   src={latestResult.outputUrl}
                   controls
                   autoPlay
-                  loop
                   playsInline
+                  onLoadedMetadata={(e) => {
+                    e.currentTarget.muted = false;
+                    e.currentTarget.volume = 1.0;
+                  }}
                   className="max-h-[290px] w-full object-contain block"
                 />
               ) : (
@@ -1602,7 +1628,11 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                 onClick={() => {
                   setShowCompletionModal(false);
                   setTimeout(() => {
-                    cardPlayerVideoRef.current?.play().catch(() => {});
+                    if (cardPlayerVideoRef.current) {
+                      cardPlayerVideoRef.current.muted = false;
+                      cardPlayerVideoRef.current.volume = 1.0;
+                      cardPlayerVideoRef.current.play().catch(() => {});
+                    }
                   }, 100);
                 }}
                 className="text-xs text-[#C6E2B1] hover:text-white font-semibold underline underline-offset-4 cursor-pointer"

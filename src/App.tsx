@@ -468,8 +468,20 @@ export default function App() {
                   src={previewHistoryItem.outputUrl || previewHistoryItem.outputDownloadUrl}
                   controls
                   autoPlay
-                  loop
                   playsInline
+                  onLoadedMetadata={(e) => {
+                    e.currentTarget.muted = false;
+                    e.currentTarget.volume = 1.0;
+                  }}
+                  onError={(e) => {
+                    if (
+                      previewHistoryItem.outputDownloadUrl &&
+                      e.currentTarget.src !== previewHistoryItem.outputDownloadUrl &&
+                      !e.currentTarget.src.endsWith(previewHistoryItem.outputDownloadUrl)
+                    ) {
+                      e.currentTarget.src = previewHistoryItem.outputDownloadUrl;
+                    }
+                  }}
                   className="max-h-[330px] w-full object-contain block"
                 />
               ) : (
