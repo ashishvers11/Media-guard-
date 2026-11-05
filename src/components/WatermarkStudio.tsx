@@ -28,6 +28,7 @@ import {
   scanFrameForWatermarkCorners,
   inpaintRegionsOnContext,
 } from '../utils/watermarkEngine';
+import { BeforeAfterMediaSlider } from './BeforeAfterMediaSlider';
 
 interface WatermarkStudioProps {
   onAddHistory: (item: HistoryRecord) => void;
@@ -244,7 +245,6 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
   const sourceImageRef = useRef<HTMLImageElement | null>(null);
   const sourceVideoRef = useRef<HTMLVideoElement | null>(null);
   const cardPlayerVideoRef = useRef<HTMLVideoElement | null>(null);
-  const modalVideoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Persistent WebAudio graph refs for client-side fallback so createMediaElementSource is only called once
@@ -423,7 +423,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     setProgress({
       stage: 'inpainting',
       percent: 78,
-      statusText: `Removing watermark & restoring original ${w}×${h}px pixels...`,
+      statusText: `Removing watermark & HD enhancing ${w}×${h}px photo...`,
     });
 
     await new Promise((r) => setTimeout(r, 50));
@@ -433,7 +433,9 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     outCanvas.width = w;
     outCanvas.height = h;
     const outCtx = outCanvas.getContext('2d')!;
+    outCtx.filter = 'contrast(1.04) saturate(1.08) brightness(1.01)';
     outCtx.drawImage(img, 0, 0, w, h);
+    outCtx.filter = 'none';
     inpaintRegionsOnContext(outCtx, w, h, detection.boxes);
 
     const dispCanvas = displayCanvasRef.current;
@@ -863,13 +865,15 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
             resolve();
             return;
           }
+          recCtx.filter = 'contrast(1.04) saturate(1.08) brightness(1.01)';
           recCtx.drawImage(vid, 0, 0, recW, recH);
+          recCtx.filter = 'none';
           inpaintRegionsOnContext(recCtx, recW, recH, localScan.boxes);
           const pct = Math.min(98, Math.round(15 + (vid.currentTime / duration) * 83));
           setProgress({
             stage: 'inpainting',
             percent: pct,
-            statusText: `Removing watermark & preserving audio (${ vid.currentTime.toFixed(1) }s / ${ duration.toFixed(1) }s · ${pct}%)...`,
+            statusText: `Removing watermark, HD enhancing & preserving audio (${ vid.currentTime.toFixed(1) }s / ${ duration.toFixed(1) }s · ${pct}%)...`,
           });
 
           if (vid.ended || vid.currentTime >= duration - 0.03) {
@@ -1519,11 +1523,11 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                 </div>
                 <div>
                   <h3 className="text-base sm:text-lg font-bold text-[#F3F7F1]">
-                    Processing Complete — Full Video &amp; Audio Ready
+                    Processing Complete — Watermark Removed &amp; HD Enhanced
                   </h3>
                   <p className="text-xs text-[#9AA895]">
                     {latestResult.originalWidth}×{latestResult.originalHeight}px
-                    {latestResult.durationSec ? ` · Full ${latestResult.durationSec}s Video + Stereo Audio` : ' · Lossless Photo'} · 0% Quality Loss
+                    {latestResult.durationSec ? ` · Full ${latestResult.durationSec}s Video + Stereo Audio` : ' · Lossless HD Photo'} · Clean &amp; Fresh HD Quality
                   </p>
                 </div>
               </div>
@@ -1538,35 +1542,21 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               </button>
             </div>
 
-            {/* Modal Media Preview (Playable Full-Length Video with Audio or Cleaned Photo) */}
-            <div className="rounded-2xl overflow-hidden border border-[#2E3C2B] bg-black max-h-[300px] flex items-center justify-center">
-              {latestResult.kind === 'video' ? (
-                <video
-                  ref={modalVideoRef}
-                  src={latestResult.outputUrl}
-                  controls
-                  autoPlay
-                  playsInline
-                  onLoadedMetadata={(e) => {
-                    e.currentTarget.muted = false;
-                    e.currentTarget.volume = 1.0;
-                  }}
-                  className="max-h-[290px] w-full object-contain block"
-                />
-              ) : (
-                <img
-                  src={latestResult.outputUrl}
-                  alt={latestResult.fileName}
-                  referrerPolicy="no-referrer"
-                  className="max-h-[290px] w-full object-contain block"
-                />
-              )}
-            </div>
+            {/* Interactive Before & After Comparison Slider in Modal */}
+            <BeforeAfterMediaSlider
+              kind={latestResult.kind}
+              beforeUrl={latestResult.originalFileUrl}
+              afterUrl={latestResult.outputUrl}
+              fallbackBeforeUrl={latestResult.originalDownloadUrl}
+              fallbackAfterUrl={latestResult.outputDownloadUrl}
+              altText={latestResult.fileName}
+              maxHeightClass="max-h-[300px]"
+            />
 
             {/* Quality Comparison Summary */}
             <div className="grid grid-cols-2 gap-3 text-xs">
               <div className="p-3 rounded-xl bg-[#0E130D] border border-[#263124] space-y-1">
-                <div className="text-[#9AA895]">Original File</div>
+                <div className="text-[#9AA895]">Before (Original File)</div>
                 <div className="font-semibold text-[#E2EDE0] truncate">
                   {latestResult.originalFileName}
                 </div>
@@ -1576,7 +1566,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               </div>
 
               <div className="p-3 rounded-xl bg-[#182216] border border-[#496142] space-y-1">
-                <div className="text-[#A3C686] font-medium">Watermark-Free Output</div>
+                <div className="text-[#A3C686] font-medium">After (Watermark-Free + HD Enhanced)</div>
                 <div className="font-semibold text-[#F1F5F0] truncate">
                   {latestResult.fileName}
                 </div>

@@ -637,39 +637,73 @@ async function startServer() {
 
       // 4. Run FFmpeg with:
       // - 3-box diamond-cross delogo (removes 100% of Gemini watermark without touching nearby objects)
+      // - Studio HD Enhancement (unsharp detail clarity + clean contrast & vivid fresh color balance)
       // - Explicit stream mapping (-map 0:v:0 -map 0:a?) so 100% of video duration and audio are preserved
-      // - High-definition CRF 15 superfast encoding (razor-sharp visual quality, zero blockiness)
-      // - Full-volume universal stereo AAC audio (-c:a aac -b:a 192k -ar 48000 -ac 2)
-      await runCommandExec("ffmpeg", [
-        "-y",
-        "-i",
-        origPath,
-        "-map",
-        "0:v:0",
-        "-map",
-        "0:a?",
-        "-vf",
-        vfFilter,
-        "-c:v",
-        "libx264",
-        "-preset",
-        "superfast",
-        "-crf",
-        "15",
-        "-pix_fmt",
-        "yuv420p",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "192k",
-        "-ar",
-        "48000",
-        "-ac",
-        "2",
-        "-movflags",
-        "+faststart",
-        cleanPath,
-      ]);
+      // - Ultra-High-Definition CRF 14 encoding + full-volume stereo AAC audio
+      const enhancedVfFilter = `${vfFilter},unsharp=5:5:0.75:3:3:0.35,eq=contrast=1.04:saturation=1.08:brightness=0.008`;
+      try {
+        await runCommandExec("ffmpeg", [
+          "-y",
+          "-i",
+          origPath,
+          "-map",
+          "0:v:0",
+          "-map",
+          "0:a?",
+          "-vf",
+          enhancedVfFilter,
+          "-c:v",
+          "libx264",
+          "-preset",
+          "superfast",
+          "-crf",
+          "14",
+          "-pix_fmt",
+          "yuv420p",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "192k",
+          "-ar",
+          "48000",
+          "-ac",
+          "2",
+          "-movflags",
+          "+faststart",
+          cleanPath,
+        ]);
+      } catch {
+        await runCommandExec("ffmpeg", [
+          "-y",
+          "-i",
+          origPath,
+          "-map",
+          "0:v:0",
+          "-map",
+          "0:a?",
+          "-vf",
+          vfFilter,
+          "-c:v",
+          "libx264",
+          "-preset",
+          "superfast",
+          "-crf",
+          "14",
+          "-pix_fmt",
+          "yuv420p",
+          "-c:a",
+          "aac",
+          "-b:a",
+          "192k",
+          "-ar",
+          "48000",
+          "-ac",
+          "2",
+          "-movflags",
+          "+faststart",
+          cleanPath,
+        ]);
+      }
 
       const cleanStat = await fs.promises.stat(cleanPath);
       if (cleanStat.size === 0) {

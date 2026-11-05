@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { HistoryRecord } from './types/media';
 import { WatermarkStudio, triggerReliableDownload } from './components/WatermarkStudio';
+import { BeforeAfterMediaSlider } from './components/BeforeAfterMediaSlider';
 
 const STORAGE_KEY_HISTORY = 'mediaguard_processing_history_v4';
 const STORAGE_KEY_CHANNEL_POPUP = 'mediaguard_channel_popup_seen_v1';
@@ -462,37 +463,15 @@ export default function App() {
               </button>
             </div>
 
-            <div className="rounded-2xl overflow-hidden border border-[#2E3C2B] bg-black max-h-[340px] flex items-center justify-center">
-              {previewHistoryItem.kind === 'video' ? (
-                <video
-                  src={previewHistoryItem.outputUrl || previewHistoryItem.outputDownloadUrl}
-                  controls
-                  autoPlay
-                  playsInline
-                  onLoadedMetadata={(e) => {
-                    e.currentTarget.muted = false;
-                    e.currentTarget.volume = 1.0;
-                  }}
-                  onError={(e) => {
-                    if (
-                      previewHistoryItem.outputDownloadUrl &&
-                      e.currentTarget.src !== previewHistoryItem.outputDownloadUrl &&
-                      !e.currentTarget.src.endsWith(previewHistoryItem.outputDownloadUrl)
-                    ) {
-                      e.currentTarget.src = previewHistoryItem.outputDownloadUrl;
-                    }
-                  }}
-                  className="max-h-[330px] w-full object-contain block"
-                />
-              ) : (
-                <img
-                  src={previewHistoryItem.outputUrl || previewHistoryItem.outputDownloadUrl}
-                  alt={previewHistoryItem.fileName}
-                  referrerPolicy="no-referrer"
-                  className="max-h-[330px] w-full object-contain block"
-                />
-              )}
-            </div>
+            <BeforeAfterMediaSlider
+              kind={previewHistoryItem.kind}
+              beforeUrl={previewHistoryItem.originalFileUrl}
+              afterUrl={previewHistoryItem.outputUrl}
+              fallbackBeforeUrl={previewHistoryItem.originalDownloadUrl}
+              fallbackAfterUrl={previewHistoryItem.outputDownloadUrl}
+              altText={previewHistoryItem.fileName}
+              maxHeightClass="max-h-[330px]"
+            />
 
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <button
