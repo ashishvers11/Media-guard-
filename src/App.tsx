@@ -12,7 +12,7 @@ import {
 import { HistoryRecord } from './types/media';
 import { WatermarkStudio, triggerReliableDownload } from './components/WatermarkStudio';
 
-const STORAGE_KEY_HISTORY = 'mediaguard_processing_history_v3';
+const STORAGE_KEY_HISTORY = 'mediaguard_processing_history_v4';
 const STORAGE_KEY_CHANNEL_POPUP = 'mediaguard_channel_popup_seen_v1';
 
 const TELEGRAM_CHANNEL_URL = 'https://t.me/+TAbMK2L7iMBkMDQ1';

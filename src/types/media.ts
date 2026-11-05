@@ -15,6 +15,7 @@ export interface WatermarkBox {
 
 export type ProcessingStage =
   | 'idle'
+  | 'uploading'
   | 'analyzing'
   | 'detecting-ai'
   | 'inpainting'

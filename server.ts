@@ -91,7 +91,7 @@ function scanFramePixelsForStarWatermark(
   // Calibrated exact Gemini watermark geometry
   const defaultCx = isPortrait ? Math.round(W * 0.8328) : Math.round(W * 0.92);
   const defaultCy = isPortrait ? Math.round(H * 0.9059) : Math.round(H * 0.915);
-  const defaultR = Math.max(18, Math.round(minDim * (isPortrait ? 0.0382 : 0.042)));
+  const defaultR = Math.max(18, Math.round(minDim * (isPortrait ? 0.039 : 0.043)));
 
   let cx = defaultCx;
   let cy = defaultCy;
@@ -99,10 +99,10 @@ function scanFramePixelsForStarWatermark(
   let ry = defaultR;
 
   try {
-    const cropX = Math.round(W * 0.70);
+    const cropX = Math.round(W * 0.72);
     const cropY = Math.round(H * 0.82);
-    const cropW = Math.min(W - cropX, Math.round(W * 0.28));
-    const cropH = Math.min(H - cropY, Math.round(H * 0.16));
+    const cropW = Math.min(W - cropX, Math.round(W * 0.275));
+    const cropH = Math.min(H - cropY, Math.round(H * 0.175));
 
     if (cropW > 40 && cropH > 40) {
       const rawRes = spawnSync(
@@ -139,11 +139,11 @@ function scanFramePixelsForStarWatermark(
         }
         const bgLum = bgCount > 0 ? bgLumSum / bgCount : 165;
 
-        // Scan the interior star search zone for semi-transparent white watermark pixels
-        const searchX0 = Math.round(cropW * 0.22);
-        const searchX1 = Math.round(cropW * 0.82);
-        const searchY0 = Math.round(cropH * 0.18);
-        const searchY1 = Math.round(cropH * 0.82);
+        // Scan the corner zone (76%..98.5% X, 84%..98.5% Y) for bright semi-transparent watermark pixels
+        const searchX0 = Math.round(cropW * 0.14);
+        const searchX1 = Math.round(cropW * 0.96);
+        const searchY0 = Math.round(cropH * 0.12);
+        const searchY1 = Math.round(cropH * 0.94);
 
         let minX = cropW;
         let maxX = 0;
@@ -157,7 +157,7 @@ function scanFramePixelsForStarWatermark(
           for (let x = searchX0; x < searchX1; x++) {
             const idx = (y * cropW + x) * 3;
             const lum = 0.299 * buf[idx] + 0.587 * buf[idx + 1] + 0.114 * buf[idx + 2];
-            if (lum > bgLum + 13.5 && lum > 115) {
+            if (lum > bgLum + 13 && lum > 115) {
               if (x < minX) minX = x;
               if (x > maxX) maxX = x;
               if (y < minY) minY = y;
@@ -173,16 +173,16 @@ function scanFramePixelsForStarWatermark(
         const spanH = maxY - minY;
         const expectedSpan = defaultR * 2;
         if (
-          count >= 60 &&
-          spanW >= expectedSpan * 0.45 &&
-          spanW <= expectedSpan * 1.45 &&
-          spanH >= expectedSpan * 0.45 &&
-          spanH <= expectedSpan * 1.45
+          count >= 55 &&
+          spanW >= expectedSpan * 0.42 &&
+          spanW <= expectedSpan * 1.6 &&
+          spanH >= expectedSpan * 0.42 &&
+          spanH <= expectedSpan * 1.6
         ) {
           cx = Math.round(cropX + sumX / count);
           cy = Math.round(cropY + sumY / count);
-          rx = Math.max(defaultR, Math.round(spanW * 0.5 + minDim * 0.009));
-          ry = Math.max(defaultR, Math.round(spanH * 0.5 + minDim * 0.009));
+          rx = Math.max(defaultR, Math.round(spanW * 0.5 + minDim * 0.01));
+          ry = Math.max(defaultR, Math.round(spanH * 0.5 + minDim * 0.01));
         }
       }
     }
@@ -232,19 +232,19 @@ function buildDiamondCrossDelogoFilter(
     return `delogo=x=${x}:y=${y}:w=${w}:h=${h}:show=0`;
   };
 
-  // 1. Center core diamond body (0.64 * radius)
-  const coreW = rx * 1.28;
-  const coreH = ry * 1.28;
+  // 1. Center core diamond body
+  const coreW = rx * 1.36;
+  const coreH = ry * 1.36;
   const fCore = clampBox(cx - coreW * 0.5, cy - coreH * 0.5, coreW, coreH);
 
   // 2. Horizontal star tips (full width, tight height)
-  const horizW = rx * 2.02;
-  const horizH = ry * 0.7;
+  const horizW = rx * 2.1;
+  const horizH = ry * 0.74;
   const fHoriz = clampBox(cx - horizW * 0.5, cy - horizH * 0.5, horizW, horizH);
 
   // 3. Vertical star tips (tight width, full height)
-  const vertW = rx * 0.7;
-  const vertH = ry * 2.02;
+  const vertW = rx * 0.74;
+  const vertH = ry * 2.1;
   const fVert = clampBox(cx - vertW * 0.5, cy - vertH * 0.5, vertW, vertH);
 
   return `${fCore},${fHoriz},${fVert}`;
@@ -346,6 +346,46 @@ async function detectWatermarkOnFrameWithGemini(
   return defaultBox;
 }
 
+function resolveMediaFile(id: string): StoredMediaMeta | null {
+  const fromRam = storedMediaMap.get(id);
+  if (fromRam && fs.existsSync(fromRam.filePath)) {
+    return fromRam;
+  }
+
+  // Fallback to disk lookup in MEDIA_STORAGE_DIR if server restarted
+  if (id.startsWith("clean_vid_")) {
+    const safeId = id.replace(/^clean_vid_/, "").replace(/[^a-zA-Z0-9_-]/g, "");
+    const p = path.join(MEDIA_STORAGE_DIR, `clean_${safeId}.mp4`);
+    if (fs.existsSync(p)) {
+      const st = fs.statSync(p);
+      const meta: StoredMediaMeta = {
+        filePath: p,
+        mimeType: "video/mp4",
+        downloadName: `video_${safeId}_watermark_free.mp4`,
+        sizeBytes: st.size,
+      };
+      storedMediaMap.set(id, meta);
+      return meta;
+    }
+  } else if (id.startsWith("orig_vid_")) {
+    const safeId = id.replace(/^orig_vid_/, "").replace(/[^a-zA-Z0-9_-]/g, "");
+    const p = path.join(MEDIA_STORAGE_DIR, `upload_${safeId}.mp4`);
+    if (fs.existsSync(p)) {
+      const st = fs.statSync(p);
+      const meta: StoredMediaMeta = {
+        filePath: p,
+        mimeType: "video/mp4",
+        downloadName: `video_${safeId}_original.mp4`,
+        sizeBytes: st.size,
+      };
+      storedMediaMap.set(id, meta);
+      return meta;
+    }
+  }
+
+  return null;
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -356,21 +396,86 @@ async function startServer() {
     res.json({ status: "ok", service: "MediaGuard Studio API" });
   });
 
-  // Stream stored media for in-card & modal <video> / <img> playback and authenticated fetch() blob downloads
+  // Stream stored media for instant <video> / <img> playback using 8MB-capped 206 Partial Content ranges
   app.get("/api/media/:id", (req, res) => {
-    const meta = storedMediaMap.get(req.params.id);
+    const meta = resolveMediaFile(req.params.id);
     if (!meta || !fs.existsSync(meta.filePath)) {
       res.status(404).send("Media file not found");
       return;
     }
-    res.setHeader("Content-Type", meta.mimeType);
+
+    const total = meta.sizeBytes;
+    const range = req.headers.range;
+    const MAX_STREAM_CHUNK = 8 * 1024 * 1024; // 8 MB per range response (well below Cloud Run 32 MB limit)
+
     res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("Content-Type", meta.mimeType);
     res.setHeader("Cache-Control", "no-store");
-    res.sendFile(meta.filePath);
+
+    if (range) {
+      const parts = range.replace(/bytes=/, "").split("-");
+      const start = Math.max(0, parseInt(parts[0], 10) || 0);
+      const requestedEnd = parts[1] ? parseInt(parts[1], 10) : total - 1;
+      const end = Math.min(total - 1, requestedEnd, start + MAX_STREAM_CHUNK - 1);
+
+      if (start >= total || end < start) {
+        res.status(416).setHeader("Content-Range", `bytes */${total}`).end();
+        return;
+      }
+
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${total}`);
+      res.setHeader("Content-Length", String(end - start + 1));
+
+      const stream = fs.createReadStream(meta.filePath, { start, end });
+      stream.on("error", () => {
+        if (!res.headersSent) res.status(500).end();
+      });
+      stream.pipe(res);
+    } else if (total <= MAX_STREAM_CHUNK * 3) {
+      res.setHeader("Content-Length", String(total));
+      fs.createReadStream(meta.filePath).pipe(res);
+    } else {
+      const end = Math.min(total - 1, MAX_STREAM_CHUNK - 1);
+      res.status(206);
+      res.setHeader("Content-Range", `bytes 0-${end}/${total}`);
+      res.setHeader("Content-Length", String(end + 1));
+      fs.createReadStream(meta.filePath, { start: 0, end }).pipe(res);
+    }
+  });
+
+  // 5 MB Chunked Binary Download Endpoint (Bypasses Cloud Run's 32 MB HTTP response size limit for 40MB-100MB+ videos!)
+  app.get("/api/download-chunk", (req, res) => {
+    const id = String(req.query.id || "");
+    const meta = resolveMediaFile(id);
+    if (!meta || !fs.existsSync(meta.filePath)) {
+      res.status(404).json({ error: "Media file not found" });
+      return;
+    }
+
+    const start = Math.max(0, Number(req.query.start ?? 0));
+    const requestedEnd = Number(req.query.end ?? start + 5 * 1024 * 1024 - 1);
+    const safeEnd = Math.min(meta.sizeBytes - 1, requestedEnd);
+
+    if (start >= meta.sizeBytes || safeEnd < start) {
+      res.status(416).end();
+      return;
+    }
+
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Length", String(safeEnd - start + 1));
+    res.setHeader("X-Total-Size", String(meta.sizeBytes));
+    res.setHeader("Cache-Control", "no-store");
+
+    const stream = fs.createReadStream(meta.filePath, { start, end: safeEnd });
+    stream.on("error", () => {
+      if (!res.headersSent) res.status(500).end();
+    });
+    stream.pipe(res);
   });
 
   app.get("/api/download/:id", (req, res) => {
-    const meta = storedMediaMap.get(req.params.id);
+    const meta = resolveMediaFile(req.params.id);
     if (!meta || !fs.existsSync(meta.filePath)) {
       res.status(404).send("Download file not found");
       return;
@@ -385,11 +490,12 @@ async function startServer() {
     res.download(meta.filePath, customName);
   });
 
-  // Chunked Binary Upload Endpoint (Each chunk <= 8 MB so files of 35MB, 100MB+ never hit Nginx's 32MB limit)
+  // Chunked Binary Upload Endpoint (Each chunk <= 5 MB at exact byte offset so retries never duplicate data)
   app.post("/api/upload-chunk", async (req, res) => {
     try {
       const uploadId = String(req.query.uploadId || "").replace(/[^a-zA-Z0-9_-]/g, "");
       const index = Number(req.query.index ?? 0);
+      const offset = Number(req.query.offset ?? -1);
 
       if (!uploadId) {
         res.status(400).json({ error: "Missing uploadId" });
@@ -397,10 +503,19 @@ async function startServer() {
       }
 
       const targetPath = path.join(MEDIA_STORAGE_DIR, `upload_${uploadId}.mp4`);
-      const flags = index === 0 ? "w" : "a";
+      if (index === 0 && !fs.existsSync(targetPath)) {
+        await fs.promises.writeFile(targetPath, Buffer.alloc(0));
+      }
 
       await new Promise<void>((resolve, reject) => {
-        const writeStream = fs.createWriteStream(targetPath, { flags });
+        const streamOpts: { flags: string; start?: number } =
+          index === 0
+            ? { flags: "w" }
+            : offset >= 0 && fs.existsSync(targetPath)
+            ? { flags: "r+", start: offset }
+            : { flags: "a" };
+
+        const writeStream = fs.createWriteStream(targetPath, streamOpts);
         req.pipe(writeStream);
         writeStream.on("finish", () => resolve());
         writeStream.on("error", (err) => reject(err));
@@ -505,7 +620,7 @@ async function startServer() {
         );
       }
 
-      // 4. Run FFmpeg with 3-box diamond-cross delogo + visually lossless CRF 13 + direct audio stream copy
+      // 4. Run FFmpeg with 3-box diamond-cross delogo + fast high-definition CRF 17 + direct audio stream copy
       try {
         await runCommandExec("ffmpeg", [
           "-y",
@@ -518,7 +633,7 @@ async function startServer() {
           "-preset",
           "ultrafast",
           "-crf",
-          "13",
+          "17",
           "-pix_fmt",
           "yuv420p",
           "-c:a",
@@ -540,7 +655,7 @@ async function startServer() {
           "-preset",
           "ultrafast",
           "-crf",
-          "13",
+          "17",
           "-pix_fmt",
           "yuv420p",
           "-c:a",
