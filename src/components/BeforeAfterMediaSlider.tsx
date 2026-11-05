@@ -28,14 +28,13 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
   fallbackBeforeUrl,
   fallbackAfterUrl,
   altText = 'Processed Media',
-  maxHeightClass = 'max-h-[320px]',
+  maxHeightClass = 'max-h-[300px]',
 }) => {
   const [sliderPct, setSliderPct] = useState<number>(50);
   const [isDragging, setIsDragging] = useState<boolean>(false);
   const [viewMode, setViewMode] = useState<'slider' | 'player'>('slider');
 
-  // Video playback state for synchronized Before/After video comparison
-  const [isPlaying, setIsPlaying] = useState<boolean>(true);
+  const [isPlaying, setIsPlaying] = useState<boolean>(false);
   const [isMuted, setIsMuted] = useState<boolean>(false);
   const [currentTime, setCurrentTime] = useState<number>(0);
   const [duration, setDuration] = useState<number>(0);
@@ -50,7 +49,7 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
     const rect = el.getBoundingClientRect();
     if (rect.width <= 0) return;
     const rawPct = ((clientX - rect.left) / rect.width) * 100;
-    setSliderPct(Math.max(2, Math.min(98, Number(rawPct.toFixed(1)))));
+    setSliderPct(Math.max(3, Math.min(97, Number(rawPct.toFixed(1)))));
   }, []);
 
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
@@ -72,13 +71,12 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
     }
   };
 
-  // Keep Before video time-synced with the master After video (which carries the full stereo audio)
   const syncBeforeVideo = useCallback(() => {
     const afterVid = afterVideoRef.current;
     const beforeVid = beforeVideoRef.current;
     if (!afterVid || !beforeVid) return;
 
-    if (Math.abs(beforeVid.currentTime - afterVid.currentTime) > 0.18) {
+    if (Math.abs(beforeVid.currentTime - afterVid.currentTime) > 0.2) {
       try {
         beforeVid.currentTime = afterVid.currentTime;
       } catch {
@@ -87,18 +85,39 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
     }
   }, []);
 
+  // Safely attempt autoplay on mount: try unmuted first, and if mobile WebView blocks unmuted autoplay,
+  // start muted so the video still plays smoothly until the user taps Sound On / Play!
   useEffect(() => {
-    if (kind !== 'video') return;
+    if (kind !== 'video' || viewMode !== 'slider') return;
     const afterVid = afterVideoRef.current;
     const beforeVid = beforeVideoRef.current;
     if (!afterVid) return;
 
-    afterVid.muted = isMuted;
-    afterVid.volume = 1.0;
     if (beforeVid) {
       beforeVid.muted = true;
+      beforeVid.play().catch(() => {});
     }
-  }, [kind, isMuted, viewMode]);
+
+    afterVid.muted = false;
+    afterVid.volume = 1.0;
+    const playPromise = afterVid.play();
+    if (playPromise !== undefined) {
+      playPromise
+        .then(() => {
+          setIsPlaying(true);
+          setIsMuted(false);
+        })
+        .catch(() => {
+          // Mobile WebView blocked unmuted autoplay — play muted automatically until user taps Sound On
+          afterVid.muted = true;
+          setIsMuted(true);
+          afterVid
+            .play()
+            .then(() => setIsPlaying(true))
+            .catch(() => setIsPlaying(false));
+        });
+    }
+  }, [kind, viewMode, afterUrl]);
 
   const handleTogglePlay = (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -107,9 +126,14 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
     if (!afterVid) return;
 
     if (afterVid.paused) {
-      afterVid.muted = isMuted;
+      afterVid.muted = false;
       afterVid.volume = 1.0;
-      afterVid.play().catch(() => {});
+      setIsMuted(false);
+      afterVid.play().catch(() => {
+        afterVid.muted = true;
+        setIsMuted(true);
+        afterVid.play().catch(() => {});
+      });
       beforeVid?.play().catch(() => {});
       setIsPlaying(true);
     } else {
@@ -126,7 +150,14 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
     setIsMuted(nextMuted);
     if (afterVid) {
       afterVid.muted = nextMuted;
-      if (!nextMuted) afterVid.volume = 1.0;
+      if (!nextMuted) {
+        afterVid.volume = 1.0;
+        if (afterVid.paused) {
+          afterVid.play().catch(() => {});
+          beforeVideoRef.current?.play().catch(() => {});
+          setIsPlaying(true);
+        }
+      }
     }
   };
 
@@ -137,7 +168,14 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
     if (!afterVid) return;
     afterVid.currentTime = 0;
     if (beforeVid) beforeVid.currentTime = 0;
-    afterVid.play().catch(() => {});
+    afterVid.muted = false;
+    afterVid.volume = 1.0;
+    setIsMuted(false);
+    afterVid.play().catch(() => {
+      afterVid.muted = true;
+      setIsMuted(true);
+      afterVid.play().catch(() => {});
+    });
     beforeVid?.play().catch(() => {});
     setIsPlaying(true);
   };
@@ -150,19 +188,19 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
   };
 
   return (
-    <div className="space-y-2.5">
-      {/* Top Mode Switcher Bar: Before/After Interactive Slider vs Full Player */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-1">
-        <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#C6E2B1]">
-          <Sparkles className="w-3.5 h-3.5 text-[#A3C686]" />
-          <span>
+    <div className="space-y-2.5 w-full min-w-0">
+      {/* Mode Switcher Bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="inline-flex items-center gap-1.5 text-xs font-semibold text-[#C6E2B1] min-w-0">
+          <Sparkles className="w-3.5 h-3.5 text-[#A3C686] shrink-0" />
+          <span className="truncate">
             {viewMode === 'slider'
-              ? 'Swipe Left/Right to Compare Before & After HD Enhancement'
-              : 'Full HD Enhanced Preview Player'}
+              ? 'Swipe to Compare Before & After HD'
+              : 'Full HD Enhanced Player'}
           </span>
         </div>
 
-        <div className="inline-flex items-center gap-1 bg-[#0E130D] border border-[#283425] rounded-xl p-1">
+        <div className="inline-flex items-center gap-1 bg-[#0C100B] border border-[#283425] rounded-xl p-1 shrink-0">
           <button
             type="button"
             onClick={() => setViewMode('slider')}
@@ -173,7 +211,7 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
             }`}
           >
             <SlidersHorizontal className="w-3 h-3" />
-            <span>Before / After Slider</span>
+            <span>Compare</span>
           </button>
 
           <button
@@ -194,17 +232,20 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
       {/* Media Viewport */}
       {viewMode === 'player' ? (
         <div
-          className={`rounded-2xl overflow-hidden border border-[#2E3C2B] bg-black ${maxHeightClass} flex items-center justify-center`}
+          className={`rounded-2xl overflow-hidden border border-[#2E3C2B] bg-black ${maxHeightClass} flex items-center justify-center w-full`}
         >
           {kind === 'video' ? (
             <video
               src={afterUrl || fallbackAfterUrl}
               controls
-              autoPlay
               playsInline
               onLoadedMetadata={(e) => {
                 e.currentTarget.muted = false;
                 e.currentTarget.volume = 1.0;
+                e.currentTarget.play().catch(() => {
+                  e.currentTarget.muted = true;
+                  e.currentTarget.play().catch(() => {});
+                });
               }}
               onError={(e) => {
                 if (
@@ -233,7 +274,7 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
-          className={`relative rounded-2xl overflow-hidden border border-[#384B34] bg-black ${maxHeightClass} flex items-center justify-center select-none touch-none cursor-ew-resize`}
+          className={`relative rounded-2xl overflow-hidden border border-[#384B34] bg-black ${maxHeightClass} flex items-center justify-center select-none touch-none cursor-ew-resize w-full`}
         >
           {kind === 'video' ? (
             <div className="relative w-full h-full flex items-center justify-center">
@@ -241,12 +282,9 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
               <video
                 ref={afterVideoRef}
                 src={afterUrl || fallbackAfterUrl}
-                autoPlay
                 loop
                 playsInline
                 onLoadedMetadata={(e) => {
-                  e.currentTarget.muted = isMuted;
-                  e.currentTarget.volume = 1.0;
                   setDuration(e.currentTarget.duration || 0);
                 }}
                 onTimeUpdate={(e) => {
@@ -278,7 +316,6 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
               <video
                 ref={beforeVideoRef}
                 src={beforeUrl || fallbackBeforeUrl}
-                autoPlay
                 loop
                 muted
                 playsInline
@@ -299,7 +336,6 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
             </div>
           ) : (
             <div className="relative w-full h-full flex items-center justify-center">
-              {/* Base Layer: AFTER (Watermark-Free + HD Enhanced Photo) */}
               <img
                 src={afterUrl || fallbackAfterUrl}
                 alt={`${altText} (After)`}
@@ -307,7 +343,6 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
                 className={`${maxHeightClass} w-full object-contain block pointer-events-none`}
               />
 
-              {/* Top Clipped Layer: BEFORE (Original Photo) */}
               <img
                 src={beforeUrl || fallbackBeforeUrl}
                 alt={`${altText} (Before)`}
@@ -320,26 +355,26 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
             </div>
           )}
 
-          {/* BEFORE / AFTER Floating Corner Labels */}
+          {/* BEFORE / AFTER Floating Corner Badges */}
           <div className="absolute top-2.5 left-2.5 z-10 pointer-events-none">
-            <span className="px-2.5 py-1 rounded-lg bg-black/75 border border-white/15 text-[11px] font-bold text-[#D5E3CE] tracking-wide uppercase backdrop-blur-sm">
-              Before (Original)
+            <span className="px-2 py-0.5 rounded-md bg-black/80 border border-white/15 text-[10px] font-bold text-[#D5E3CE] tracking-wider uppercase backdrop-blur-sm">
+              Before
             </span>
           </div>
 
           <div className="absolute top-2.5 right-2.5 z-10 pointer-events-none">
-            <span className="px-2.5 py-1 rounded-lg bg-[#151B14]/90 border border-[#84A96A] text-[11px] font-bold text-[#A3C686] tracking-wide uppercase backdrop-blur-sm flex items-center gap-1">
-              <Sparkles className="w-3 h-3" />
-              <span>After (Clean + HD Enhanced)</span>
+            <span className="px-2 py-0.5 rounded-md bg-[#151B14]/90 border border-[#84A96A] text-[10px] font-bold text-[#A3C686] tracking-wider uppercase backdrop-blur-sm flex items-center gap-1">
+              <Sparkles className="w-2.5 h-2.5" />
+              <span>After HD</span>
             </span>
           </div>
 
           {/* Interactive Split Line & Touch Handle */}
           <div
             style={{ left: `${sliderPct}%` }}
-            className="absolute inset-y-0 z-20 w-0.5 bg-[#A3C686] shadow-[0_0_12px_rgba(163,198,134,0.9)] pointer-events-none"
+            className="absolute inset-y-0 z-20 w-0.5 bg-[#A3C686] shadow-[0_0_10px_rgba(163,198,134,0.9)] pointer-events-none"
           >
-            <div className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-9 h-9 rounded-full bg-[#84A96A] border-2 border-[#0B0F0A] shadow-xl flex items-center justify-center text-[#0B0F0A] font-bold text-xs">
+            <div className="absolute top-1/2 -translate-x-1/2 -translate-y-1/2 w-8 h-8 rounded-full bg-[#84A96A] border-2 border-[#0B0F0A] shadow-xl flex items-center justify-center text-[#0B0F0A] font-bold text-xs">
               ‹›
             </div>
           </div>
@@ -348,7 +383,7 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
           {kind === 'video' && (
             <div
               onPointerDown={(e) => e.stopPropagation()}
-              className="absolute bottom-2.5 left-2.5 right-2.5 z-30 flex items-center justify-between gap-2 bg-[#0E130D]/90 border border-[#2C3A29] backdrop-blur-md px-3 py-1.5 rounded-xl text-xs"
+              className="absolute bottom-2 left-2 right-2 z-30 flex items-center justify-between gap-2 bg-[#0E130D]/90 border border-[#2C3A29] backdrop-blur-md px-2.5 py-1.5 rounded-xl text-xs"
             >
               <div className="flex items-center gap-1.5">
                 <button
@@ -373,17 +408,17 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
                   type="button"
                   onClick={handleToggleMute}
                   className="px-2 py-1 rounded-lg bg-[#1B2319] hover:bg-[#253022] border border-[#32422F] text-[#E6F2DC] inline-flex items-center gap-1 cursor-pointer"
-                  title={isMuted ? 'Unmute Audio' : 'Mute Audio'}
+                  title={isMuted ? 'Tap to Enable Sound' : 'Mute Sound'}
                 >
                   {isMuted ? (
                     <>
                       <VolumeX className="w-3.5 h-3.5 text-[#F87171]" />
-                      <span className="hidden sm:inline">Muted</span>
+                      <span>Tap for Sound</span>
                     </>
                   ) : (
                     <>
                       <Volume2 className="w-3.5 h-3.5 text-[#A3C686]" />
-                      <span className="hidden sm:inline">Sound On</span>
+                      <span>Sound On</span>
                     </>
                   )}
                 </button>
@@ -398,7 +433,7 @@ export const BeforeAfterMediaSlider: React.FC<BeforeAfterMediaSliderProps> = ({
                 </button>
               </div>
 
-              <div className="font-mono text-[11px] text-[#C6D4C0] tabular-nums">
+              <div className="font-mono text-[11px] text-[#C6D4C0] tabular-nums shrink-0">
                 {formatTime(currentTime)} / {formatTime(duration)}
               </div>
             </div>

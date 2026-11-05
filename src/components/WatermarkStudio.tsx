@@ -37,8 +37,34 @@ interface WatermarkStudioProps {
 const preloadedBlobUrls = new Map<string, string>();
 
 /**
+ * Checks whether the Express + FFmpeg backend API is reachable (and returning real JSON,
+ * not Netlify's SPA index.html fallback).
+ */
+async function checkBackendServerAvailable(): Promise<boolean> {
+  if (typeof window !== 'undefined' && window.location.hostname.includes('netlify.app')) {
+    return false;
+  }
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 2500);
+    const res = await fetch('/api/health', {
+      credentials: 'include',
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+    if (!res.ok) return false;
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('application/json')) return false;
+    const data = await res.json();
+    return data && data.status === 'ok';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Uploads a single binary chunk via XMLHttpRequest so mobile browsers report real-time byte-level
- * upload progress (`xhr.upload.onprogress`) every ~80ms instead of freezing between chunks.
+ * upload progress (`xhr.upload.onprogress`) every ~80ms.
  */
 function uploadChunkWithXHR(
   url: string,
@@ -58,9 +84,11 @@ function uploadChunkWithXHR(
     };
 
     xhr.onload = () => {
+      const ct = xhr.getResponseHeader('content-type') || '';
+      const isJson = ct.includes('application/json');
       resolve({
-        ok: xhr.status >= 200 && xhr.status < 300,
-        status: xhr.status,
+        ok: xhr.status >= 200 && xhr.status < 300 && isJson,
+        status: isJson ? xhr.status : 404,
       });
     };
 
@@ -72,8 +100,7 @@ function uploadChunkWithXHR(
 
 /**
  * Downloads a server-stored media file in parallel 4 MB binary chunks and reassembles it into a
- * complete verified local Blob in browser memory. Bypasses Cloud Run's 32 MB single-response limit
- * while completing 3x faster than sequential chunks!
+ * complete verified local Blob in browser memory.
  */
 export async function fetchServerMediaInChunks(
   mediaUrlOrId: string,
@@ -83,10 +110,9 @@ export async function fetchServerMediaInChunks(
   const match = mediaUrlOrId.match(/\/api\/(?:media|download)\/([^?&#/]+)/);
   const mediaId = match ? match[1] : mediaUrlOrId;
 
-  const CHUNK_SIZE = 4 * 1024 * 1024; // 4 MB per chunk
+  const CHUNK_SIZE = 4 * 1024 * 1024;
   let totalSize = expectedSizeBytes && expectedSizeBytes > 0 ? expectedSizeBytes : 0;
 
-  // Fetch chunk 0 first if we don't know totalSize yet
   const fetchSingleRange = async (start: number, end: number): Promise<ArrayBuffer> => {
     for (let attempt = 0; attempt < 4; attempt++) {
       try {
@@ -137,7 +163,6 @@ export async function fetchServerMediaInChunks(
     }
   };
 
-  // Run 3 parallel workers for fast mobile download
   const concurrency = Math.min(3, numChunks);
   await Promise.all(Array.from({ length: concurrency }, () => worker()));
 
@@ -149,7 +174,7 @@ export async function fetchServerMediaInChunks(
 }
 
 /**
- * Reliable in-iframe downloader that guarantees a non-zero Blob before triggering browser download.
+ * Reliable downloader that guarantees a non-zero Blob before triggering browser download.
  */
 export async function triggerReliableDownload(
   primaryUrl: string,
@@ -160,7 +185,6 @@ export async function triggerReliableDownload(
   try {
     let targetBlobUrl = '';
 
-    // 1. If primaryUrl is already a live in-memory blob: URL, verify it is still valid & non-zero
     if (primaryUrl && primaryUrl.startsWith('blob:')) {
       try {
         const check = await fetch(primaryUrl);
@@ -173,12 +197,10 @@ export async function triggerReliableDownload(
       }
     }
 
-    // 2. Check preloaded cache
     if (!targetBlobUrl && fallbackServerUrl && preloadedBlobUrls.has(fallbackServerUrl)) {
       targetBlobUrl = preloadedBlobUrls.get(fallbackServerUrl)!;
     }
 
-    // 3. If not a live blob: URL, download in parallel 4 MB chunks from the server
     if (!targetBlobUrl) {
       const sourceUrl = fallbackServerUrl || primaryUrl;
       if (sourceUrl.includes('/api/media/') || sourceUrl.includes('/api/download/')) {
@@ -232,7 +254,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
   const [progress, setProgress] = useState<ProcessingProgress>({
     stage: 'idle',
     percent: 0,
-    statusText: 'Upload a photo or video — watermark detection & removal runs automatically.',
+    statusText: 'Upload a photo or video — watermark removal & HD enhancement run automatically.',
   });
 
   const [latestResult, setLatestResult] = useState<HistoryRecord | null>(null);
@@ -247,11 +269,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
   const cardPlayerVideoRef = useRef<HTMLVideoElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Persistent WebAudio graph refs for client-side fallback so createMediaElementSource is only called once
   const audioCtxRef = useRef<AudioContext | null>(null);
-  const mediaElementSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
-  const audioDestRef = useRef<MediaStreamAudioDestinationNode | null>(null);
-
   const isProcessingRef = useRef<boolean>(false);
   const activeJobIdRef = useRef<number>(0);
 
@@ -290,7 +308,9 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
           canvas.width = w;
           canvas.height = h;
         }
+        ctx.filter = showRawOriginal ? 'none' : 'contrast(1.04) saturate(1.08) brightness(1.01)';
         ctx.drawImage(img, 0, 0, w, h);
+        ctx.filter = 'none';
         if (!showRawOriginal) {
           inpaintRegionsOnContext(ctx, w, h, activeBoxes);
         }
@@ -302,7 +322,12 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
           canvas.width = w;
           canvas.height = h;
         }
+        ctx.filter =
+          showRawOriginal || showManualAdjust
+            ? 'none'
+            : 'contrast(1.04) saturate(1.08) brightness(1.01)';
         ctx.drawImage(vid, 0, 0, w, h);
+        ctx.filter = 'none';
         if (!showRawOriginal && !showManualAdjust) {
           inpaintRegionsOnContext(ctx, w, h, activeBoxes);
         }
@@ -330,6 +355,14 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
 
     const localScan = scanFrameForWatermarkCorners(snapCtx, w, h);
 
+    if (typeof window !== 'undefined' && window.location.hostname.includes('netlify.app')) {
+      return {
+        boxes: localScan.boxes,
+        label: localScan.boxes[0].label,
+        confidence: localScan.confidence,
+      };
+    }
+
     try {
       const apiThumb = document.createElement('canvas');
       const scale = Math.min(1, 768 / Math.max(w, h));
@@ -338,7 +371,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       apiThumb.getContext('2d')!.drawImage(sourceEl, 0, 0, apiThumb.width, apiThumb.height);
 
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 3000);
+      const timer = setTimeout(() => controller.abort(), 2500);
 
       const res = await fetch('/api/detect-watermark', {
         method: 'POST',
@@ -353,13 +386,14 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       });
       clearTimeout(timer);
 
-      if (res.ok) {
+      const ct = res.headers.get('content-type') || '';
+      if (res.ok && ct.includes('application/json')) {
         const data = await res.json();
         if (Array.isArray(data.regions) && data.regions.length > 0) {
           const apiBoxes: WatermarkBox[] = data.regions.map(
             (r: { label?: string; xPct: number; yPct: number; wPct: number; hPct: number }, i: number) => ({
               id: `auto-ai-${i}-${Date.now()}`,
-              label: r.label || data.watermarkType || 'Bottom-Right Gemini Watermark',
+              label: r.label || data.watermarkType || 'Gemini Star Watermark',
               xPct: Number(r.xPct),
               yPct: Number(r.yPct),
               wPct: Number(r.wPct),
@@ -448,7 +482,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     setProgress({
       stage: 'encoding',
       percent: 92,
-      statusText: 'Encoding lossless original-quality photo...',
+      statusText: 'Encoding lossless HD enhanced photo...',
     });
 
     const outMime = file.type === 'image/webp' ? 'image/webp' : 'image/png';
@@ -498,15 +532,13 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     setProgress({
       stage: 'completed',
       percent: 100,
-      statusText: `Ready! Watermark removed (${w}×${h}px · ${formatBytes(outBlob.size)}).`,
+      statusText: `Ready! Watermark removed & HD enhanced (${w}×${h}px · ${formatBytes(outBlob.size)}).`,
       elapsedMs: totalElapsed,
     });
   };
 
   // AUTOMATIC VIDEO PIPELINE:
-  // 1. Uploads video in fast 2 MB chunks with real-time XHR byte progress (`Uploading: 14.2 MB / 35.6 MB`)
-  // 2. Server runs FFmpeg Gemini star watermark detection + Diamond-Cross delogo removal with full stereo AAC audio
-  // 3. Assembles the complete MP4 Blob in parallel 4 MB chunks so 100% of the video duration & full audio play without interruption!
+  // Works on BOTH Full-Stack Server (FFmpeg CRF 14 + Stereo Audio) AND Static Hosts (Netlify WebView-safe pipeline)
   const runAutomaticVideoPipeline = async (
     jobId: number,
     file: File,
@@ -523,11 +555,12 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
 
     setProgress({
       stage: 'uploading',
-      percent: 4,
-      statusText: `Uploading Video: 0.00 MB / ${formatBytes(file.size)} (0%)...`,
+      percent: 6,
+      statusText: `Uploading Video: ${file.name} (${formatBytes(file.size)})...`,
     });
 
-    // Seek briefly to capture preview thumbnail
+    // Seek briefly while muted to capture preview frame
+    vid.muted = true;
     vid.pause();
     vid.currentTime = Math.min(0.15, duration * 0.1);
     await new Promise<void>((resolve) => {
@@ -562,209 +595,229 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     let tickerId: ReturnType<typeof setInterval> | null = null;
 
     try {
-      // STEP 1: Upload video in 2 MB chunks with real-time XHR byte progress & 5 retries per chunk
-      const CHUNK_SIZE = 2 * 1024 * 1024; // 2 MB per chunk for fast, reliable mobile uploads
-      const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
-      const uploadId = `${Date.now()}_${jobId}`;
-      let serverAvailable = true;
-
-      for (let idx = 0; idx < totalChunks; idx++) {
-        if (activeJobIdRef.current !== jobId) return;
-
-        const startByte = idx * CHUNK_SIZE;
-        const endByte = Math.min(file.size, startByte + CHUNK_SIZE);
-        const chunkBlob = file.slice(startByte, endByte);
-
-        let chunkOk = false;
-        for (let attempt = 0; attempt < 5; attempt++) {
-          try {
-            const chunkUrl = `/api/upload-chunk?uploadId=${encodeURIComponent(
-              uploadId
-            )}&index=${idx}&offset=${startByte}`;
-
-            const chunkRes = await uploadChunkWithXHR(chunkUrl, chunkBlob, (loadedInChunk) => {
-              if (activeJobIdRef.current !== jobId) return;
-              const totalUploadedBytes = Math.min(file.size, startByte + loadedInChunk);
-              const uploadRatio = totalUploadedBytes / Math.max(1, file.size);
-              const overallPct = Math.min(54, Math.max(4, Math.round(4 + uploadRatio * 50)));
-              const uploadPctText = Math.min(100, Math.round(uploadRatio * 100));
-
-              setProgress({
-                stage: 'uploading',
-                percent: overallPct,
-                statusText: `Uploading Video: ${formatBytes(totalUploadedBytes)} / ${formatBytes(
-                  file.size
-                )} (${uploadPctText}%)`,
-              });
-            });
-
-            // Only switch to static fallback if the server explicitly returns 404/405 (e.g. Netlify static hosting)
-            if (chunkRes.status === 404 || chunkRes.status === 405) {
-              serverAvailable = false;
-              break;
-            }
-            if (chunkRes.ok) {
-              chunkOk = true;
-              break;
-            }
-          } catch {
-            // Transient mobile network blip — retry up to 5 times
-          }
-          await new Promise((r) => setTimeout(r, 400));
-        }
-
-        if (!serverAvailable) break;
-        if (!chunkOk) {
-          throw new Error(`Video upload interrupted at chunk ${idx + 1}/${totalChunks}. Please retry.`);
-        }
-      }
-
-      if (activeJobIdRef.current !== jobId) return;
+      let serverAvailable = await checkBackendServerAvailable();
 
       if (serverAvailable) {
-        // STEP 2: Trigger Server-Side FFmpeg Watermark Detection + Diamond-Cross Delogo + Full Stereo Audio
-        let currentPct = 58;
-        setProgress({
-          stage: 'detecting-ai',
-          percent: currentPct,
-          statusText: `Detecting Gemini watermark on ${vw}×${vh}px video (${duration.toFixed(1)}s)...`,
-        });
+        // STEP 1: Upload video in 2 MB chunks with real-time XHR byte progress
+        const CHUNK_SIZE = 2 * 1024 * 1024;
+        const totalChunks = Math.max(1, Math.ceil(file.size / CHUNK_SIZE));
+        const uploadId = `${Date.now()}_${jobId}`;
 
-        tickerId = setInterval(() => {
+        for (let idx = 0; idx < totalChunks; idx++) {
           if (activeJobIdRef.current !== jobId) return;
-          currentPct = Math.min(84, currentPct + 2);
-          const activeStage = currentPct < 68 ? 'detecting-ai' : 'inpainting';
-          setProgress({
-            stage: activeStage,
-            percent: currentPct,
-            statusText:
-              currentPct < 68
-                ? `Detecting exact Gemini star watermark coordinates (${currentPct}%)...`
-                : `Removing watermark & preserving full audio + original quality (${currentPct}%)...`,
-          });
-        }, 300);
 
-        const finalizeRes = await fetch('/api/process-video-finalize', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'include',
-          body: JSON.stringify({
-            uploadId,
-            fileName: file.name,
-            overrideBox: overrideBoxes ? overrideBoxes[0] : undefined,
-          }),
-        });
+          const startByte = idx * CHUNK_SIZE;
+          const endByte = Math.min(file.size, startByte + CHUNK_SIZE);
+          const chunkBlob = file.slice(startByte, endByte);
 
-        if (tickerId) {
-          clearInterval(tickerId);
-          tickerId = null;
-        }
+          let chunkOk = false;
+          for (let attempt = 0; attempt < 4; attempt++) {
+            try {
+              const chunkUrl = `/api/upload-chunk?uploadId=${encodeURIComponent(
+                uploadId
+              )}&index=${idx}&offset=${startByte}`;
 
-        if (!finalizeRes.ok) {
-          const errData = await finalizeRes.json().catch(() => ({}));
-          throw new Error(errData.error || `Processing failed (${finalizeRes.status})`);
-        }
+              const chunkRes = await uploadChunkWithXHR(chunkUrl, chunkBlob, (loadedInChunk) => {
+                if (activeJobIdRef.current !== jobId) return;
+                const totalUploadedBytes = Math.min(file.size, startByte + loadedInChunk);
+                const uploadRatio = totalUploadedBytes / Math.max(1, file.size);
+                const overallPct = Math.min(54, Math.max(5, Math.round(5 + uploadRatio * 49)));
+                const uploadPctText = Math.min(100, Math.round(uploadRatio * 100));
 
-        const serverResult = await finalizeRes.json();
-        if (activeJobIdRef.current !== jobId) return;
+                setProgress({
+                  stage: 'uploading',
+                  percent: overallPct,
+                  statusText: `Uploading: ${formatBytes(totalUploadedBytes)} / ${formatBytes(
+                    file.size
+                  )} (${uploadPctText}%)`,
+                });
+              });
 
-        if (serverResult.detectedBox) {
-          const detBox: WatermarkBox = {
-            id: `det-${Date.now()}`,
-            label: serverResult.detectedBox.label || 'Gemini Star Watermark',
-            xPct: Number(serverResult.detectedBox.xPct),
-            yPct: Number(serverResult.detectedBox.yPct),
-            wPct: Number(serverResult.detectedBox.wPct),
-            hPct: Number(serverResult.detectedBox.hPct),
-          };
-          setBoxes([detBox]);
-          inpaintRegionsOnContext(procCtx, vw, vh, [detBox]);
-        }
-
-        const cleanedThumbUrl = procCanvas.toDataURL('image/jpeg', 0.75);
-        const finalW = serverResult.width || vw;
-        const finalH = serverResult.height || vh;
-        const finalDurationSec = Number((serverResult.durationSec || duration).toFixed(1));
-        setNativeWidth(finalW);
-        setNativeHeight(finalH);
-
-        // STEP 3: Assemble the complete cleaned MP4 in parallel 4 MB chunks so <video> playback has
-        // 100% of the full video duration and full stereo volume with zero mid-playback resets!
-        setProgress({
-          stage: 'encoding',
-          percent: 86,
-          statusText: `Preparing full ${finalDurationSec}s HD video with audio (${formatBytes(
-            serverResult.outputSizeBytes
-          )})...`,
-        });
-
-        const cleanVideoBlob = await fetchServerMediaInChunks(
-          serverResult.outputMediaUrl,
-          serverResult.outputSizeBytes,
-          (loaded, total) => {
-            if (activeJobIdRef.current !== jobId) return;
-            const dlPct = Math.min(99, Math.round(86 + (loaded / Math.max(1, total)) * 13));
-            setProgress({
-              stage: 'encoding',
-              percent: dlPct,
-              statusText: `Preparing full ${finalDurationSec}s HD video (${formatBytes(
-                loaded
-              )} / ${formatBytes(total)})...`,
-            });
+              if (chunkRes.status === 404 || chunkRes.status === 405) {
+                serverAvailable = false;
+                break;
+              }
+              if (chunkRes.ok) {
+                chunkOk = true;
+                break;
+              }
+            } catch {
+              // Retry chunk
+            }
+            await new Promise((r) => setTimeout(r, 350));
           }
-        );
+
+          if (!serverAvailable) break;
+          if (!chunkOk) {
+            throw new Error(`Upload interrupted at chunk ${idx + 1}/${totalChunks}. Please retry.`);
+          }
+        }
 
         if (activeJobIdRef.current !== jobId) return;
 
-        const localCleanVideoUrl = URL.createObjectURL(cleanVideoBlob);
-        preloadedBlobUrls.set(serverResult.outputMediaUrl, localCleanVideoUrl);
+        if (serverAvailable) {
+          // STEP 2: Trigger Server-Side FFmpeg Watermark Removal + HD Enhancement + Full Stereo Audio
+          let currentPct = 58;
+          setProgress({
+            stage: 'detecting-ai',
+            percent: currentPct,
+            statusText: `Detecting Gemini watermark on ${vw}×${vh}px video (${duration.toFixed(1)}s)...`,
+          });
 
-        const totalElapsed = Math.round(performance.now() - startMs);
-        const finalSizeBytes = cleanVideoBlob.size || serverResult.outputSizeBytes;
+          tickerId = setInterval(() => {
+            if (activeJobIdRef.current !== jobId) return;
+            currentPct = Math.min(84, currentPct + 2);
+            const activeStage = currentPct < 68 ? 'detecting-ai' : 'inpainting';
+            setProgress({
+              stage: activeStage,
+              percent: currentPct,
+              statusText:
+                currentPct < 68
+                  ? `Detecting exact Gemini star watermark (${currentPct}%)...`
+                  : `Removing watermark, HD enhancing & preserving audio (${currentPct}%)...`,
+            });
+          }, 300);
 
-        const record: HistoryRecord = {
-          id: `hist-vid-${jobId}`,
-          originalFileName: file.name,
-          originalFileUrl: origUrl,
-          originalDownloadUrl: serverResult.originalMediaUrl,
-          fileName: serverResult.cleanedFileName,
-          kind: 'video',
-          originalWidth: finalW,
-          originalHeight: finalH,
-          originalSizeBytes: file.size,
-          outputSizeBytes: finalSizeBytes,
-          outputMimeType: 'video/mp4',
-          outputUrl: localCleanVideoUrl,
-          outputDownloadUrl: serverResult.outputMediaUrl,
-          originalPreviewUrl: origThumbUrl,
-          cleanedPreviewUrl: cleanedThumbUrl,
-          detectedType: serverResult.detectedBox?.label || 'Gemini Star Watermark',
-          confidence: serverResult.detectedBox?.confidence || 0.99,
-          regionsCount: 1,
-          durationSec: finalDurationSec,
-          processedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-          processingTimeMs: totalElapsed,
-          inpaintMode: 'telea-harmonic',
-        };
+          const finalizeRes = await fetch('/api/process-video-finalize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify({
+              uploadId,
+              fileName: file.name,
+              overrideBox: overrideBoxes ? overrideBoxes[0] : undefined,
+            }),
+          });
 
-        isProcessingRef.current = false;
-        setLatestResult(record);
-        onAddHistory(record);
-        setShowCompletionModal(true);
+          if (tickerId) {
+            clearInterval(tickerId);
+            tickerId = null;
+          }
 
-        setProgress({
-          stage: 'completed',
-          percent: 100,
-          statusText: `Ready! Full ${finalDurationSec}s video cleaned with audio (${finalW}×${finalH}px · ${formatBytes(
-            finalSizeBytes
-          )}).`,
-          elapsedMs: totalElapsed,
-        });
-        return;
+          if (!finalizeRes.ok) {
+            const errData = await finalizeRes.json().catch(() => ({}));
+            throw new Error(errData.error || `Processing failed (${finalizeRes.status})`);
+          }
+
+          const serverResult = await finalizeRes.json();
+          if (activeJobIdRef.current !== jobId) return;
+
+          if (serverResult.detectedBox) {
+            const detBox: WatermarkBox = {
+              id: `det-${Date.now()}`,
+              label: serverResult.detectedBox.label || 'Gemini Star Watermark',
+              xPct: Number(serverResult.detectedBox.xPct),
+              yPct: Number(serverResult.detectedBox.yPct),
+              wPct: Number(serverResult.detectedBox.wPct),
+              hPct: Number(serverResult.detectedBox.hPct),
+            };
+            setBoxes([detBox]);
+            inpaintRegionsOnContext(procCtx, vw, vh, [detBox]);
+          }
+
+          const cleanedThumbUrl = procCanvas.toDataURL('image/jpeg', 0.75);
+          const finalW = serverResult.width || vw;
+          const finalH = serverResult.height || vh;
+          const finalDurationSec = Number((serverResult.durationSec || duration).toFixed(1));
+          setNativeWidth(finalW);
+          setNativeHeight(finalH);
+
+          // STEP 3: Assemble full MP4 Blob in parallel 4 MB chunks
+          setProgress({
+            stage: 'encoding',
+            percent: 86,
+            statusText: `Loading HD enhanced ${finalDurationSec}s video (${formatBytes(
+              serverResult.outputSizeBytes
+            )})...`,
+          });
+
+          const cleanVideoBlob = await fetchServerMediaInChunks(
+            serverResult.outputMediaUrl,
+            serverResult.outputSizeBytes,
+            (loaded, total) => {
+              if (activeJobIdRef.current !== jobId) return;
+              const dlPct = Math.min(99, Math.round(86 + (loaded / Math.max(1, total)) * 13));
+              setProgress({
+                stage: 'encoding',
+                percent: dlPct,
+                statusText: `Loading HD video (${formatBytes(loaded)} / ${formatBytes(total)})...`,
+              });
+            }
+          );
+
+          if (activeJobIdRef.current !== jobId) return;
+
+          const localCleanVideoUrl = URL.createObjectURL(cleanVideoBlob);
+          preloadedBlobUrls.set(serverResult.outputMediaUrl, localCleanVideoUrl);
+
+          const totalElapsed = Math.round(performance.now() - startMs);
+          const finalSizeBytes = cleanVideoBlob.size || serverResult.outputSizeBytes;
+
+          const record: HistoryRecord = {
+            id: `hist-vid-${jobId}`,
+            originalFileName: file.name,
+            originalFileUrl: origUrl,
+            originalDownloadUrl: serverResult.originalMediaUrl,
+            fileName: serverResult.cleanedFileName,
+            kind: 'video',
+            originalWidth: finalW,
+            originalHeight: finalH,
+            originalSizeBytes: file.size,
+            outputSizeBytes: finalSizeBytes,
+            outputMimeType: 'video/mp4',
+            outputUrl: localCleanVideoUrl,
+            outputDownloadUrl: serverResult.outputMediaUrl,
+            originalPreviewUrl: origThumbUrl,
+            cleanedPreviewUrl: cleanedThumbUrl,
+            detectedType: serverResult.detectedBox?.label || 'Gemini Star Watermark',
+            confidence: serverResult.detectedBox?.confidence || 0.99,
+            regionsCount: 1,
+            durationSec: finalDurationSec,
+            processedAt: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+            processingTimeMs: totalElapsed,
+            inpaintMode: 'telea-harmonic',
+          };
+
+          isProcessingRef.current = false;
+          setLatestResult(record);
+          onAddHistory(record);
+          setShowCompletionModal(true);
+
+          setProgress({
+            stage: 'completed',
+            percent: 100,
+            statusText: `Ready! Full ${finalDurationSec}s HD enhanced video with audio (${finalW}×${finalH}px · ${formatBytes(
+              finalSizeBytes
+            )}).`,
+            elapsedMs: totalElapsed,
+          });
+          return;
+        }
       }
 
-      // STATIC HOSTING MODE (Only used on static hosts like Netlify where /api/upload-chunk returns 404):
-      // Preserves 100% of video duration AND 100% of full-volume audio via WebAudio MediaStreamDestination!
+      // =========================================================================
+      // STATIC HOSTING MODE (Netlify / Mobile WebView Safe Pipeline):
+      // 1. Keeps vid.muted = true ALWAYS so Android WebView / Telegram NEVER throws
+      //    "play() can only be initiated by a user gesture"!
+      // 2. Extracts 100% full-volume original audio directly from file.arrayBuffer()
+      //    via AudioContext.decodeAudioData() into MediaStreamDestination!
+      // 3. Enhances every frame (contrast + saturation + brightness) & removes watermark!
+      // =========================================================================
+      setProgress({
+        stage: 'uploading',
+        percent: 22,
+        statusText: `Reading ${file.name} (${formatBytes(file.size)}) into memory...`,
+      });
+
+      const fileArrayBuf = await file.arrayBuffer();
+      if (activeJobIdRef.current !== jobId) return;
+
+      setProgress({
+        stage: 'detecting-ai',
+        percent: 38,
+        statusText: `Detecting Gemini watermark & decoding stereo audio (${vw}×${vh}px)...`,
+      });
+
       const localScan = overrideBoxes
         ? { boxes: overrideBoxes, confidence: 0.99 }
         : scanFrameForWatermarkCorners(procCtx, vw, vh);
@@ -780,26 +833,25 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       recCanvas.height = recH;
       const recCtx = recCanvas.getContext('2d')!;
 
-      // Capture full-volume audio from <video> into MediaStream without muting it!
+      // Decode full-volume audio directly from the uploaded file bytes (no unmuted <video> play needed!)
       let audioTracks: MediaStreamTrack[] = [];
+      let audioBufferSource: AudioBufferSourceNode | null = null;
       try {
         if (!audioCtxRef.current) {
           audioCtxRef.current = new AudioContext();
         }
         const aCtx = audioCtxRef.current;
         if (aCtx.state === 'suspended') {
-          await aCtx.resume();
+          await aCtx.resume().catch(() => {});
         }
-        if (!mediaElementSourceRef.current) {
-          mediaElementSourceRef.current = aCtx.createMediaElementSource(vid);
-          audioDestRef.current = aCtx.createMediaStreamDestination();
-          mediaElementSourceRef.current.connect(audioDestRef.current);
-        }
-        if (audioDestRef.current) {
-          audioTracks = audioDestRef.current.stream.getAudioTracks();
-        }
+        const decodedAudio = await aCtx.decodeAudioData(fileArrayBuf.slice(0));
+        const destNode = aCtx.createMediaStreamDestination();
+        audioBufferSource = aCtx.createBufferSource();
+        audioBufferSource.buffer = decodedAudio;
+        audioBufferSource.connect(destNode);
+        audioTracks = destNode.stream.getAudioTracks();
       } catch {
-        // Fallback to captureStream audio track if available
+        // Video has no audio track or browser couldn't decode audio container
       }
 
       const canvasVideoStream = recCanvas.captureStream(30);
@@ -837,10 +889,9 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
           );
       });
 
-      // Seek cleanly to 0.0s and wait for seeked BEFORE starting recorder & playback
+      // Keep vid.muted = true so WebView NEVER throws "play() can only be initiated by a user gesture"
       vid.pause();
-      vid.muted = false;
-      vid.volume = 1.0;
+      vid.muted = true;
       vid.currentTime = 0;
       await new Promise<void>((resolve) => {
         let done = false;
@@ -856,49 +907,105 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       });
 
       recorder.start(100);
-      await vid.play();
+      if (audioBufferSource) {
+        try {
+          audioBufferSource.start(0);
+        } catch {
+          // Ignore if already started
+        }
+      }
 
-      await new Promise<void>((resolve) => {
-        const drawTick = () => {
-          if (activeJobIdRef.current !== jobId) {
+      // Attempt muted playback; if a strict WebView blocks even muted play(), fall back to deterministic frame stepping!
+      const playSucceeded = await vid
+        .play()
+        .then(() => true)
+        .catch(() => false);
+
+      if (playSucceeded) {
+        await new Promise<void>((resolve) => {
+          const drawTick = () => {
+            if (activeJobIdRef.current !== jobId) {
+              if (recorder.state !== 'inactive') recorder.stop();
+              resolve();
+              return;
+            }
+            recCtx.filter = 'contrast(1.04) saturate(1.08) brightness(1.01)';
+            recCtx.drawImage(vid, 0, 0, recW, recH);
+            recCtx.filter = 'none';
+            inpaintRegionsOnContext(recCtx, recW, recH, localScan.boxes);
+
+            const pct = Math.min(98, Math.round(42 + (vid.currentTime / duration) * 56));
+            setProgress({
+              stage: 'inpainting',
+              percent: pct,
+              statusText: `Cleaning watermark & HD enhancing (${vid.currentTime.toFixed(1)}s / ${duration.toFixed(1)}s)...`,
+            });
+
+            if (vid.ended || vid.currentTime >= duration - 0.03) {
+              if (recorder.state !== 'inactive') recorder.stop();
+              resolve();
+              return;
+            }
+
+            if (vid.paused && !vid.ended) {
+              vid.muted = true;
+              vid.play().catch(() => {});
+            }
+
+            requestAnimationFrame(drawTick);
+          };
+          vid.onended = () => {
             if (recorder.state !== 'inactive') recorder.stop();
             resolve();
-            return;
-          }
+          };
+          requestAnimationFrame(drawTick);
+        });
+      } else {
+        // Gesture-free deterministic frame stepping at 24fps if WebView blocked vid.play()
+        const fps = 24;
+        const totalFrames = Math.max(1, Math.ceil(duration * fps));
+        for (let f = 0; f < totalFrames; f++) {
+          if (activeJobIdRef.current !== jobId) break;
+          const targetTime = Math.min(duration - 0.01, f / fps);
+          vid.currentTime = targetTime;
+          await new Promise<void>((resolve) => {
+            let done = false;
+            const finish = () => {
+              if (!done) {
+                done = true;
+                vid.removeEventListener('seeked', finish);
+                resolve();
+              }
+            };
+            vid.addEventListener('seeked', finish);
+            setTimeout(finish, 40);
+          });
           recCtx.filter = 'contrast(1.04) saturate(1.08) brightness(1.01)';
           recCtx.drawImage(vid, 0, 0, recW, recH);
           recCtx.filter = 'none';
           inpaintRegionsOnContext(recCtx, recW, recH, localScan.boxes);
-          const pct = Math.min(98, Math.round(15 + (vid.currentTime / duration) * 83));
+
+          const pct = Math.min(98, Math.round(42 + ((f + 1) / totalFrames) * 56));
           setProgress({
             stage: 'inpainting',
             percent: pct,
-            statusText: `Removing watermark, HD enhancing & preserving audio (${ vid.currentTime.toFixed(1) }s / ${ duration.toFixed(1) }s · ${pct}%)...`,
+            statusText: `Cleaning watermark & HD enhancing (${targetTime.toFixed(1)}s / ${duration.toFixed(1)}s)...`,
           });
+        }
+        if (recorder.state !== 'inactive') recorder.stop();
+      }
 
-          if (vid.ended || vid.currentTime >= duration - 0.03) {
-            if (recorder.state !== 'inactive') recorder.stop();
-            resolve();
-            return;
-          }
-
-          // If mobile browser briefly paused the video before the end, resume immediately
-          if (vid.paused && !vid.ended) {
-            vid.play().catch(() => {});
-          }
-
-          requestAnimationFrame(drawTick);
-        };
-        vid.onended = () => {
-          if (recorder.state !== 'inactive') recorder.stop();
-          resolve();
-        };
-        requestAnimationFrame(drawTick);
-      });
+      if (audioBufferSource) {
+        try {
+          audioBufferSource.stop();
+        } catch {
+          // Ignore
+        }
+      }
 
       const outBlob = await recDone;
       if (outBlob.size === 0) {
-        throw new Error('Browser video encoder returned 0 bytes.');
+        throw new Error('Video encoder returned 0 bytes.');
       }
 
       const localCleanUrl = URL.createObjectURL(outBlob);
@@ -938,7 +1045,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       setProgress({
         stage: 'completed',
         percent: 100,
-        statusText: `Ready! Full ${duration.toFixed(1)}s video cleaned with audio (${recW}×${recH}px · ${formatBytes(
+        statusText: `Ready! Full ${duration.toFixed(1)}s HD enhanced video (${recW}×${recH}px · ${formatBytes(
           outBlob.size
         )}).`,
         elapsedMs: totalElapsed,
@@ -955,10 +1062,22 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     }
   };
 
-  // Triggered when user selects or drops a photo or video
+  // Triggered when user selects or drops a photo or video (Runs inside user gesture!)
   const handleSelectFile = (file: File) => {
     const nextJobId = activeJobIdRef.current + 1;
     activeJobIdRef.current = nextJobId;
+
+    // Synchronously unlock WebAudio inside the active user gesture
+    try {
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new AudioContext();
+      }
+      if (audioCtxRef.current.state === 'suspended') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+    } catch {
+      // Ignore
+    }
 
     const isVideo = file.type.startsWith('video/') || /\.(mp4|webm|mov|mkv)$/i.test(file.name);
     const kind: MediaKind = isVideo ? 'video' : 'photo';
@@ -976,7 +1095,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
 
     setProgress({
       stage: 'uploading',
-      percent: 4,
+      percent: 5,
       statusText: `Uploading ${file.name} (${formatBytes(file.size)})...`,
     });
 
@@ -994,6 +1113,8 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       const vid = sourceVideoRef.current;
       if (vid) {
         let triggered = false;
+        vid.muted = true;
+        vid.playsInline = true;
         vid.onloadedmetadata = () => {
           if (triggered || activeJobIdRef.current !== nextJobId) return;
           triggered = true;
@@ -1003,12 +1124,19 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
           runAutomaticVideoPipeline(nextJobId, file, url, vid);
         };
         vid.src = url;
-        vid.load();
+        // Synchronously prime video element inside the user gesture so mobile WebView unlocks it
+        const p = vid.play();
+        if (p !== undefined) {
+          p.then(() => {
+            vid.pause();
+          }).catch(() => {
+            vid.load();
+          });
+        }
       }
     }
   };
 
-  // Re-run with custom manual box if user adjusted the box
   const handleReprocessWithCustomBox = () => {
     if (!mediaFile || !originalObjectUrl) return;
     const nextJobId = activeJobIdRef.current + 1;
@@ -1044,7 +1172,10 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     v.muted = false;
     v.volume = 1.0;
     if (v.paused) {
-      v.play();
+      v.play().catch(() => {
+        v.muted = true;
+        v.play().catch(() => {});
+      });
       setIsCardVideoPlaying(true);
     } else {
       v.pause();
@@ -1058,11 +1189,13 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     v.muted = false;
     v.volume = 1.0;
     v.currentTime = 0;
-    v.play();
+    v.play().catch(() => {
+      v.muted = true;
+      v.play().catch(() => {});
+    });
     setIsCardVideoPlaying(true);
   };
 
-  // Drag/resize handlers for optional manual adjustment
   const handleBoxPointerDown = (
     e: React.PointerEvent<HTMLDivElement>,
     mode: 'move' | 'resize'
@@ -1125,7 +1258,6 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     progress.stage === 'inpainting' ||
     progress.stage === 'encoding';
 
-  // Determine active step index (1 = Uploading, 2 = Detecting, 3 = Removing, 4 = Ready)
   const activeStepIndex =
     progress.stage === 'uploading' || progress.stage === 'analyzing'
       ? 1
@@ -1145,7 +1277,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
     : latestResult?.outputUrl || '';
 
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
+    <div className="w-full max-w-4xl mx-auto space-y-5 min-w-0">
       <input
         ref={fileInputRef}
         type="file"
@@ -1157,16 +1289,17 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
         }}
         className="hidden"
       />
-      {/* Keep offscreen 1x1px (NOT display:none) so mobile browsers never throttle or pause video decoding */}
+      {/* Contained 1x1px video inside viewport bounds so mobile WebViews never shift horizontally */}
       <video
         ref={sourceVideoRef}
-        className="fixed -left-[9999px] top-0 w-1 h-1 opacity-0 pointer-events-none"
+        className="fixed left-0 top-0 w-px h-px opacity-0 pointer-events-none overflow-hidden -z-10"
         playsInline
+        muted
         crossOrigin="anonymous"
       />
 
       {/* Main Studio Card */}
-      <div className="bg-[#151B14] border border-[#2A3528] rounded-[28px] p-4 sm:p-6 space-y-5">
+      <div className="bg-[#121811] border border-[#263224] rounded-3xl p-4 sm:p-6 space-y-4 shadow-[0_20px_50px_rgba(0,0,0,0.5)] w-full min-w-0 overflow-hidden">
         {!mediaFile ? (
           <div
             onDragOver={(e) => e.preventDefault()}
@@ -1176,40 +1309,43 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               if (f) handleSelectFile(f);
             }}
             onClick={() => fileInputRef.current?.click()}
-            className="rounded-[22px] border-2 border-dashed border-[#496142] bg-[#1C251A] hover:bg-[#222D20] transition-colors py-16 px-6 text-center cursor-pointer flex flex-col items-center justify-center gap-3"
+            className="rounded-2xl border-2 border-dashed border-[#3E5338] bg-[#171F15] hover:bg-[#1D271B] transition-all py-14 sm:py-16 px-5 text-center cursor-pointer flex flex-col items-center justify-center gap-3.5"
           >
-            <div className="w-14 h-14 rounded-2xl bg-[#84A96A]/20 border border-[#84A96A] flex items-center justify-center">
+            <div className="w-14 h-14 rounded-2xl bg-[#84A96A]/15 border border-[#84A96A]/60 flex items-center justify-center shadow-inner">
               <Upload className="w-6 h-6 text-[#A3C686]" />
             </div>
-            <h2 className="text-xl sm:text-2xl font-bold text-[#F3F7F1]">
-              Upload Photo or Video (100% Automatic)
-            </h2>
-            <p className="text-sm text-[#9AA895] max-w-md">
-              Select any Gemini photo or video (supports 35MB+ 2K/4K files). Watermark removal runs automatically with 100% original duration &amp; audio.
-            </p>
-            <span className="mt-2 px-5 py-2.5 rounded-xl bg-[#84A96A] text-[#0B0F0A] font-semibold text-sm">
-              Choose Photo or Video
+            <div className="space-y-1.5 max-w-md">
+              <h2 className="text-lg sm:text-2xl font-bold text-[#F3F7F1] tracking-tight font-display">
+                Upload Photo or Video
+              </h2>
+              <p className="text-xs sm:text-sm text-[#9AA895] leading-relaxed">
+                100% automatic Gemini watermark removal + clean HD visual enhancement with full original audio.
+              </p>
+            </div>
+            <span className="mt-1 px-6 py-3 rounded-xl bg-[#84A96A] hover:bg-[#95B97B] text-[#0B0F0A] font-bold text-xs sm:text-sm tracking-wide shadow-md transition-colors">
+              Select Photo or Video
             </span>
           </div>
         ) : (
           <>
-            {/* Top Bar inside Card */}
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div className="flex items-center gap-2 text-xs text-[#A9B8A4] font-mono">
-                <span className="text-[#F1F5F0] font-semibold truncate max-w-[200px]">
+            {/* Top Bar inside Card — Clean Mobile Responsive Stack */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-1 border-b border-[#1E281C]">
+              <div className="flex items-center gap-2 text-xs text-[#A9B8A4] font-mono min-w-0">
+                <span className="inline-block w-2 h-2 rounded-full bg-[#84A96A] shrink-0" />
+                <span className="text-[#F1F5F0] font-semibold truncate">
                   {mediaFile.name}
                 </span>
-                <span aria-hidden="true">·</span>
-                <span>{nativeWidth}×{nativeHeight}px</span>
+                <span className="text-[#566652] shrink-0">·</span>
+                <span className="shrink-0">{nativeWidth}×{nativeHeight}px</span>
                 {latestResult?.durationSec && (
                   <>
-                    <span aria-hidden="true">·</span>
-                    <span>{latestResult.durationSec}s</span>
+                    <span className="text-[#566652] shrink-0">·</span>
+                    <span className="shrink-0">{latestResult.durationSec}s</span>
                   </>
                 )}
               </div>
 
-              <div className="flex items-center gap-2">
+              <div className="grid grid-cols-2 sm:flex items-center gap-2 w-full sm:w-auto">
                 <button
                   type="button"
                   onClick={() => {
@@ -1220,32 +1356,32 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                     }
                   }}
                   disabled={isBusy}
-                  className="px-3 py-1.5 rounded-lg bg-[#1E271C] hover:bg-[#283425] border border-[#32422F] text-xs font-medium text-[#D5E3CE] inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                  className="h-9 px-3 rounded-xl bg-[#1A2218] hover:bg-[#232E21] border border-[#2F3E2C] text-xs font-semibold text-[#D5E3CE] inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
                 >
-                  <SlidersHorizontal className="w-3.5 h-3.5 text-[#A3C686]" />
-                  <span>{showManualAdjust ? 'Close Zone Adjust' : 'Adjust Watermark Zone'}</span>
+                  <SlidersHorizontal className="w-3.5 h-3.5 text-[#A3C686] shrink-0" />
+                  <span>{showManualAdjust ? 'Close Zone' : 'Adjust Zone'}</span>
                 </button>
 
                 <button
                   type="button"
                   onClick={() => fileInputRef.current?.click()}
                   disabled={isBusy}
-                  className="px-3.5 py-1.5 rounded-lg bg-[#233020] hover:bg-[#2E3F2A] border border-[#496142] text-xs font-semibold text-[#E2F1D5] inline-flex items-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50"
+                  className="h-9 px-3.5 rounded-xl bg-[#222F1F] hover:bg-[#2C3C28] border border-[#496142] text-xs font-bold text-[#E2F1D5] inline-flex items-center justify-center gap-1.5 transition-colors cursor-pointer disabled:opacity-50 whitespace-nowrap"
                 >
-                  <Upload className="w-3.5 h-3.5" />
-                  <span>Upload New File</span>
+                  <Upload className="w-3.5 h-3.5 shrink-0" />
+                  <span>New File</span>
                 </button>
               </div>
             </div>
 
-            {/* Upgraded 4-Step Visual Progress Bar (Uploading -> Detecting -> Removing -> Ready) */}
-            <div className="bg-[#10150F] border border-[#2C3A29] rounded-2xl p-4 space-y-3 shadow-inner">
-              {/* 4-Stage Stepper Pills */}
-              <div className="grid grid-cols-4 gap-1.5 sm:gap-2">
+            {/* Upgraded 4-Step Visual Progress Card — Never Truncates on Mobile! */}
+            <div className="bg-[#0D120C] border border-[#253123] rounded-2xl p-3.5 sm:p-4 space-y-3">
+              {/* 4-Stage Stepper Grid (Stacked Icon + Crisp Full Word for Mobile) */}
+              <div className="grid grid-cols-4 gap-1.5 sm:gap-2.5">
                 {[
-                  { step: 1, label: 'Uploading', icon: Upload },
-                  { step: 2, label: 'Detecting', icon: Scan },
-                  { step: 3, label: 'Removing', icon: Wand2 },
+                  { step: 1, label: 'Upload', icon: Upload },
+                  { step: 2, label: 'Detect', icon: Scan },
+                  { step: 3, label: 'Clean HD', icon: Wand2 },
                   { step: 4, label: 'Ready', icon: CheckCircle2 },
                 ].map(({ step, label, icon: Icon }) => {
                   const isCompleted = activeStepIndex > step || progress.stage === 'completed';
@@ -1253,12 +1389,12 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                   return (
                     <div
                       key={step}
-                      className={`flex items-center justify-center gap-1.5 py-1.5 px-2 rounded-xl border text-[11px] sm:text-xs font-semibold transition-all ${
+                      className={`flex flex-col sm:flex-row items-center justify-center gap-1 sm:gap-1.5 py-2 px-1.5 rounded-xl border text-[11px] sm:text-xs font-bold tracking-tight transition-all ${
                         isCurrent
-                          ? 'bg-[#84A96A]/20 border-[#84A96A] text-[#E9F5E1] shadow-[0_0_12px_rgba(132,169,106,0.25)]'
+                          ? 'bg-[#84A96A]/20 border-[#84A96A] text-[#F1F8EC] shadow-[0_0_14px_rgba(132,169,106,0.22)]'
                           : isCompleted
-                          ? 'bg-[#1B2619] border-[#42583D] text-[#A3C686]'
-                          : 'bg-[#0C100B] border-[#1D261B] text-[#667562]'
+                          ? 'bg-[#172116] border-[#3B5036] text-[#A3C686]'
+                          : 'bg-[#111610] border-[#1D261B] text-[#667562]'
                       }`}
                     >
                       {isCurrent ? (
@@ -1268,23 +1404,23 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                       ) : (
                         <Icon className="w-3.5 h-3.5 shrink-0" />
                       )}
-                      <span className="truncate">{label}</span>
+                      <span className="whitespace-nowrap">{label}</span>
                     </div>
                   );
                 })}
               </div>
 
               {/* Live Status Text & Percentage */}
-              <div className="flex items-center justify-between gap-2 text-xs">
-                <span className="text-[#D7E8C8] font-medium flex items-center gap-2 min-w-0">
+              <div className="flex items-start justify-between gap-3 text-xs">
+                <span className="text-[#D7E8C8] font-medium flex items-start gap-2 min-w-0 leading-snug">
                   {isBusy ? (
-                    <span className="inline-block w-2 h-2 rounded-full bg-[#A3C686] animate-ping shrink-0" />
+                    <span className="mt-1 inline-block w-2 h-2 rounded-full bg-[#A3C686] animate-ping shrink-0" />
                   ) : progress.stage === 'error' ? (
-                    <AlertCircle className="w-4 h-4 text-[#F87171] shrink-0" />
+                    <AlertCircle className="w-4 h-4 text-[#F87171] shrink-0 mt-0.5" />
                   ) : (
-                    <CheckCircle2 className="w-4 h-4 text-[#A3C686] shrink-0" />
+                    <CheckCircle2 className="w-4 h-4 text-[#A3C686] shrink-0 mt-0.5" />
                   )}
-                  <span className="truncate">{progress.statusText}</span>
+                  <span className="break-words">{progress.statusText}</span>
                 </span>
                 <span className="font-mono tabular-nums font-bold text-sm text-[#A3C686] shrink-0">
                   {progress.percent}%
@@ -1292,7 +1428,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               </div>
 
               {/* Smooth Animated Progress Bar Track */}
-              <div className="w-full h-3 bg-[#0A0D0A] rounded-full overflow-hidden border border-[#253123] p-0.5">
+              <div className="w-full h-2.5 bg-[#080B08] rounded-full overflow-hidden border border-[#222D20]">
                 <div
                   style={{ width: `${Math.max(3, progress.percent)}%` }}
                   className={`h-full rounded-full transition-all duration-150 ease-out ${
@@ -1306,14 +1442,14 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
 
             {/* Optional Manual Corner / Box Adjuster */}
             {showManualAdjust && (
-              <div className="bg-[#10150F] border border-[#32422F] rounded-2xl p-4 flex flex-wrap items-center justify-between gap-3">
-                <div className="flex flex-wrap items-center gap-2">
+              <div className="bg-[#0D120C] border border-[#2E3C2B] rounded-2xl p-3.5 flex flex-wrap items-center justify-between gap-2.5">
+                <div className="flex flex-wrap items-center gap-1.5">
                   {Object.entries(WATERMARK_PRESETS).map(([key, preset]) => (
                     <button
                       key={key}
                       type="button"
                       onClick={() => setBoxes([{ ...preset }])}
-                      className="px-3 py-1.5 rounded-lg bg-[#1B2319] hover:bg-[#263223] border border-[#2E3C2B] text-xs text-[#D5E3CE] cursor-pointer"
+                      className="px-2.5 py-1.5 rounded-lg bg-[#182016] hover:bg-[#232F20] border border-[#2B3829] text-xs font-medium text-[#D5E3CE] cursor-pointer"
                     >
                       {preset.label}
                     </button>
@@ -1322,7 +1458,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                 <button
                   type="button"
                   onClick={handleReprocessWithCustomBox}
-                  className="px-4 py-1.5 rounded-lg bg-[#84A96A] hover:bg-[#95B97B] text-[#0B0F0A] font-semibold text-xs cursor-pointer"
+                  className="w-full sm:w-auto px-4 py-2 rounded-xl bg-[#84A96A] hover:bg-[#95B97B] text-[#0B0F0A] font-bold text-xs cursor-pointer"
                 >
                   Apply &amp; Re-Clean Now
                 </button>
@@ -1330,23 +1466,22 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
             )}
 
             {/* Main Media Viewport inside Card */}
-            <div className="relative bg-[#10160F] rounded-[22px] overflow-hidden border border-[#2F3E2C]">
+            <div className="relative bg-[#0C100B] rounded-2xl overflow-hidden border border-[#2A3728] w-full">
               <div
                 ref={previewContainerRef}
                 onPointerMove={handleBoxPointerMove}
                 onPointerUp={handleBoxPointerUp}
-                className="relative w-full max-h-[520px] min-h-[260px] flex items-center justify-center select-none overflow-hidden bg-black"
+                className="relative w-full max-h-[500px] min-h-[240px] flex items-center justify-center select-none overflow-hidden bg-black"
               >
                 <canvas
                   ref={displayCanvasRef}
                   className={
                     showPlayableVideoInCard
                       ? 'hidden'
-                      : 'max-h-[500px] w-auto max-w-full object-contain block'
+                      : 'max-h-[480px] w-auto max-w-full object-contain block'
                   }
                 />
 
-                {/* Playable Video Player directly inside the Card once watermark removal finishes */}
                 {showPlayableVideoInCard && (
                   <video
                     ref={cardPlayerVideoRef}
@@ -1360,7 +1495,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                     }}
                     onPlay={() => setIsCardVideoPlaying(true)}
                     onPause={() => setIsCardVideoPlaying(false)}
-                    className="max-h-[500px] w-full object-contain block"
+                    className="max-h-[480px] w-full object-contain block"
                   />
                 )}
 
@@ -1373,11 +1508,11 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                       width: `${currentBox.wPct}%`,
                       height: `${currentBox.hPct}%`,
                     }}
-                    className="absolute border-2 border-[#A3C686] bg-[#84A96A]/25 rounded-lg cursor-move shadow-[0_0_0_9999px_rgba(0,0,0,0.3)]"
+                    className="absolute border-2 border-[#A3C686] bg-[#84A96A]/25 rounded-lg cursor-move"
                   >
-                    <div className="absolute -top-6 left-0 bg-[#151B14] text-[#D7E8C8] border border-[#84A96A]/50 px-2 py-0.5 rounded text-[11px] font-mono whitespace-nowrap flex items-center gap-1">
+                    <div className="absolute -top-6 right-0 bg-[#151B14] text-[#D7E8C8] border border-[#84A96A]/50 px-2 py-0.5 rounded text-[10px] font-mono whitespace-nowrap flex items-center gap-1">
                       <Move className="w-3 h-3 text-[#A3C686]" />
-                      <span>Drag or Resize Watermark Area</span>
+                      <span>Drag Zone</span>
                     </div>
                     <div
                       onPointerDown={(e) => handleBoxPointerDown(e, 'resize')}
@@ -1388,24 +1523,24 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               </div>
 
               {/* Dedicated In-Card Video Player Control & Status Bar */}
-              <div className="bg-[#6D8F54] text-[#F7FAF5] px-4 py-2.5 text-xs font-medium flex flex-wrap items-center justify-between gap-3">
-                <div className="flex items-center gap-3">
+              <div className="bg-[#182116] border-t border-[#2A3728] text-[#E6F0E0] px-3.5 py-2.5 text-xs font-medium flex flex-wrap items-center justify-between gap-2.5">
+                <div className="flex flex-wrap items-center gap-2 min-w-0">
                   {showPlayableVideoInCard && (
                     <div className="flex items-center gap-1.5">
                       <button
                         type="button"
                         onClick={handleToggleCardVideoPlay}
-                        className="px-2.5 py-1 rounded-md bg-[#111710] hover:bg-[#1C261A] text-[#E6F2DC] font-semibold inline-flex items-center gap-1 cursor-pointer"
+                        className="px-2.5 py-1 rounded-lg bg-[#84A96A] hover:bg-[#95B97B] text-[#0B0F0A] font-bold inline-flex items-center gap-1 cursor-pointer"
                       >
                         {isCardVideoPlaying ? (
                           <>
                             <Pause className="w-3.5 h-3.5" />
-                            <span>Pause Video</span>
+                            <span>Pause</span>
                           </>
                         ) : (
                           <>
                             <Play className="w-3.5 h-3.5" />
-                            <span>Play with Sound</span>
+                            <span>Play HD</span>
                           </>
                         )}
                       </button>
@@ -1413,7 +1548,7 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                       <button
                         type="button"
                         onClick={handleRestartCardVideo}
-                        className="px-2 py-1 rounded-md bg-[#111710]/80 hover:bg-[#1C261A] text-[#E6F2DC] inline-flex items-center gap-1 cursor-pointer"
+                        className="px-2 py-1 rounded-lg bg-[#111710] hover:bg-[#1C261A] border border-[#2E3C2B] text-[#D5E3CE] inline-flex items-center gap-1 cursor-pointer"
                       >
                         <RotateCcw className="w-3.5 h-3.5" />
                         <span>Replay</span>
@@ -1421,20 +1556,20 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                     </div>
                   )}
 
-                  <span className="inline-flex items-center gap-1.5">
+                  <span className="inline-flex items-center gap-1.5 text-[#A9B8A4] min-w-0">
                     {!isBusy && mediaKind === 'video' && (
-                      <Volume2 className="w-3.5 h-3.5 text-[#E6F2DC] shrink-0" />
+                      <Volume2 className="w-3.5 h-3.5 text-[#A3C686] shrink-0" />
                     )}
-                    <span>
+                    <span className="truncate">
                       {isBusy
                         ? progress.stage === 'uploading'
-                          ? 'Step 1/3: Uploading Media...'
+                          ? 'Step 1: Uploading...'
                           : progress.stage === 'detecting-ai'
-                          ? 'Step 2/3: Detecting Gemini Watermark...'
-                          : 'Step 3/3: Removing Watermark & Preserving Audio...'
+                          ? 'Step 2: Detecting Watermark...'
+                          : 'Step 3: Cleaning & HD Enhancing...'
                         : compareOriginal
-                        ? 'Viewing: Original Uploaded Media (With Watermark)'
-                        : 'Viewing: Watermark-Free Media (100% Full Duration & Audio)'}
+                        ? 'Viewing: Original Media'
+                        : 'Viewing: Watermark-Free + HD Enhanced'}
                     </span>
                   </span>
                 </div>
@@ -1443,27 +1578,27 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                   <button
                     type="button"
                     onClick={() => setCompareOriginal((prev) => !prev)}
-                    className="px-2.5 py-1 rounded-md bg-[#151B14]/70 hover:bg-[#151B14] text-white font-semibold cursor-pointer"
+                    className="px-2.5 py-1 rounded-lg bg-[#232F20] hover:bg-[#2D3C29] border border-[#3B4E37] text-[#E6F2DC] font-semibold cursor-pointer shrink-0"
                   >
-                    {compareOriginal ? 'Switch to Watermark-Free' : 'Compare Original'}
+                    {compareOriginal ? 'Show Clean HD' : 'Compare Original'}
                   </button>
                 )}
               </div>
             </div>
 
-            {/* Bottom Action Bar inside Card: Both Download Options + Re-open Modal */}
+            {/* Bottom Action Bar inside Card */}
             {latestResult && !isBusy && (
-              <div className="flex flex-col sm:flex-row items-center justify-between gap-3 pt-1">
+              <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-2.5 pt-1">
                 <button
                   type="button"
                   onClick={() => setShowCompletionModal(true)}
-                  className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-[#1E271C] hover:bg-[#273324] border border-[#3A4D36] text-xs font-semibold text-[#D7E8C8] inline-flex items-center justify-center gap-1.5 cursor-pointer"
+                  className="px-4 py-2.5 rounded-xl bg-[#1A2318] hover:bg-[#232F20] border border-[#344631] text-xs font-bold text-[#D7E8C8] inline-flex items-center justify-center gap-1.5 cursor-pointer"
                 >
                   <Sparkles className="w-3.5 h-3.5 text-[#A3C686]" />
-                  <span>Open Download Choice Modal</span>
+                  <span>Before / After Compare Modal</span>
                 </button>
 
-                <div className="flex flex-wrap items-center gap-2.5 w-full sm:w-auto justify-end">
+                <div className="grid grid-cols-2 sm:flex items-center gap-2">
                   <button
                     type="button"
                     onClick={() =>
@@ -1473,26 +1608,26 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                         latestResult.originalFileName
                       )
                     }
-                    className="flex-1 sm:flex-initial px-4 py-2.5 rounded-xl bg-[#1B2319] hover:bg-[#253022] border border-[#32422F] text-[#D5E3CE] font-semibold text-xs inline-flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                    className="px-3.5 py-2.5 rounded-xl bg-[#182016] hover:bg-[#222D1F] border border-[#2F3E2C] text-[#D5E3CE] font-semibold text-xs inline-flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
                   >
-                    <Download className="w-3.5 h-3.5" />
-                    <span>Download Original</span>
+                    <Download className="w-3.5 h-3.5 shrink-0" />
+                    <span>Original</span>
                   </button>
 
                   <button
                     type="button"
                     onClick={() => handleDownloadCleaned(latestResult)}
-                    className="flex-1 sm:flex-initial px-5 py-2.5 rounded-xl bg-[#84A96A] hover:bg-[#95B97B] text-[#0B0F0A] font-bold text-xs inline-flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
+                    className="px-4 py-2.5 rounded-xl bg-[#84A96A] hover:bg-[#95B97B] text-[#0B0F0A] font-bold text-xs inline-flex items-center justify-center gap-1.5 whitespace-nowrap cursor-pointer"
                   >
                     {downloadProgressPct !== null ? (
                       <>
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Saving ({downloadProgressPct}%)...</span>
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" />
+                        <span>Saving {downloadProgressPct}%</span>
                       </>
                     ) : (
                       <>
-                        <Download className="w-3.5 h-3.5" />
-                        <span>Download Watermark-Free</span>
+                        <Download className="w-3.5 h-3.5 shrink-0" />
+                        <span>Watermark-Free HD</span>
                       </>
                     )}
                   </button>
@@ -1504,30 +1639,32 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
       </div>
 
       {/* =========================================================================
-          PROCESSING COMPLETE MODAL: Play Video Preview + Download Original / Watermark-Free
+          PROCESSING COMPLETE MODAL: Interactive Before/After Slider + Downloads
           ========================================================================= */}
       {showCompletionModal && latestResult && (
         <div
-          className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto"
+          className="fixed inset-0 z-50 bg-black/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-4 overflow-y-auto"
           onClick={() => setShowCompletionModal(false)}
         >
           <div
-            className="bg-[#151B14] border border-[#384B34] rounded-[28px] max-w-xl w-full p-5 sm:p-6 space-y-4 shadow-2xl my-auto"
+            className="bg-[#121811] border border-[#344631] rounded-3xl max-w-xl w-full p-4 sm:p-6 space-y-4 shadow-2xl my-auto overflow-hidden"
             onClick={(e) => e.stopPropagation()}
           >
             {/* Modal Header */}
-            <div className="flex items-start justify-between gap-4 border-b border-[#253023] pb-3.5">
-              <div className="flex items-center gap-3">
-                <div className="w-10 h-10 rounded-xl bg-[#84A96A]/20 border border-[#84A96A] flex items-center justify-center shrink-0">
-                  <FileCheck className="w-5 h-5 text-[#A3C686]" />
+            <div className="flex items-start justify-between gap-3 border-b border-[#222D20] pb-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-9 h-9 rounded-xl bg-[#84A96A]/20 border border-[#84A96A] flex items-center justify-center shrink-0">
+                  <FileCheck className="w-4 h-4 text-[#A3C686]" />
                 </div>
-                <div>
-                  <h3 className="text-base sm:text-lg font-bold text-[#F3F7F1]">
-                    Processing Complete — Watermark Removed &amp; HD Enhanced
+                <div className="min-w-0">
+                  <h3 className="text-sm sm:text-base font-bold text-[#F3F7F1] truncate font-display">
+                    Watermark Removed &amp; HD Enhanced
                   </h3>
-                  <p className="text-xs text-[#9AA895]">
+                  <p className="text-[11px] sm:text-xs text-[#9AA895] truncate">
                     {latestResult.originalWidth}×{latestResult.originalHeight}px
-                    {latestResult.durationSec ? ` · Full ${latestResult.durationSec}s Video + Stereo Audio` : ' · Lossless HD Photo'} · Clean &amp; Fresh HD Quality
+                    {latestResult.durationSec
+                      ? ` · Full ${latestResult.durationSec}s Video + Audio`
+                      : ' · Lossless HD Photo'}
                   </p>
                 </div>
               </div>
@@ -1536,13 +1673,13 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                 type="button"
                 onClick={() => setShowCompletionModal(false)}
                 aria-label="Close modal"
-                className="p-1.5 rounded-lg border border-[#2C3A29] text-[#A9B8A4] hover:text-white cursor-pointer"
+                className="p-1.5 rounded-xl bg-[#1A2218] border border-[#2C3A29] text-[#A9B8A4] hover:text-white cursor-pointer shrink-0"
               >
                 <X className="w-4 h-4" />
               </button>
             </div>
 
-            {/* Interactive Before & After Comparison Slider in Modal */}
+            {/* Interactive Before & After Comparison Slider */}
             <BeforeAfterMediaSlider
               kind={latestResult.kind}
               beforeUrl={latestResult.originalFileUrl}
@@ -1550,34 +1687,34 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
               fallbackBeforeUrl={latestResult.originalDownloadUrl}
               fallbackAfterUrl={latestResult.outputDownloadUrl}
               altText={latestResult.fileName}
-              maxHeightClass="max-h-[300px]"
+              maxHeightClass="max-h-[280px]"
             />
 
             {/* Quality Comparison Summary */}
-            <div className="grid grid-cols-2 gap-3 text-xs">
-              <div className="p-3 rounded-xl bg-[#0E130D] border border-[#263124] space-y-1">
-                <div className="text-[#9AA895]">Before (Original File)</div>
+            <div className="grid grid-cols-2 gap-2.5 text-xs">
+              <div className="p-2.5 sm:p-3 rounded-xl bg-[#0C100B] border border-[#232E21] space-y-0.5 min-w-0">
+                <div className="text-[11px] text-[#8FA38B]">Before (Original)</div>
                 <div className="font-semibold text-[#E2EDE0] truncate">
                   {latestResult.originalFileName}
                 </div>
-                <div className="font-mono text-[#8FA38B]">
-                  {latestResult.originalWidth}×{latestResult.originalHeight}px · {formatBytes(latestResult.originalSizeBytes)}
+                <div className="font-mono text-[11px] text-[#7D9179] truncate">
+                  {latestResult.originalWidth}×{latestResult.originalHeight} · {formatBytes(latestResult.originalSizeBytes)}
                 </div>
               </div>
 
-              <div className="p-3 rounded-xl bg-[#182216] border border-[#496142] space-y-1">
-                <div className="text-[#A3C686] font-medium">After (Watermark-Free + HD Enhanced)</div>
+              <div className="p-2.5 sm:p-3 rounded-xl bg-[#162014] border border-[#42583D] space-y-0.5 min-w-0">
+                <div className="text-[11px] text-[#A3C686] font-semibold">After (Clean + HD)</div>
                 <div className="font-semibold text-[#F1F5F0] truncate">
                   {latestResult.fileName}
                 </div>
-                <div className="font-mono text-[#C6E2B1]">
-                  {latestResult.originalWidth}×{latestResult.originalHeight}px · {formatBytes(latestResult.outputSizeBytes)}
+                <div className="font-mono text-[11px] text-[#C6E2B1] truncate">
+                  {latestResult.originalWidth}×{latestResult.originalHeight} · {formatBytes(latestResult.outputSizeBytes)}
                 </div>
               </div>
             </div>
 
             {/* Two Choice Buttons: Download Original vs Download Watermark-Free */}
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 pt-0.5">
               <button
                 type="button"
                 onClick={() =>
@@ -1587,32 +1724,32 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                     latestResult.originalFileName
                   )
                 }
-                className="py-3 px-4 rounded-xl bg-[#1E271C] hover:bg-[#283425] border border-[#384B34] text-[#E6F0E0] font-semibold text-xs flex items-center justify-center gap-2 transition-colors whitespace-nowrap cursor-pointer"
+                className="py-3 px-4 rounded-xl bg-[#1A2218] hover:bg-[#232F20] border border-[#344631] text-[#E6F0E0] font-bold text-xs flex items-center justify-center gap-2 transition-colors whitespace-nowrap cursor-pointer"
               >
-                <Download className="w-4 h-4 text-[#A3C686]" />
+                <Download className="w-4 h-4 text-[#A3C686] shrink-0" />
                 <span>Download Original</span>
               </button>
 
               <button
                 type="button"
                 onClick={() => handleDownloadCleaned(latestResult)}
-                className="py-3 px-4 rounded-xl bg-[#84A96A] hover:bg-[#95B97B] text-[#0B0F0A] font-bold text-xs flex items-center justify-center gap-2 transition-colors whitespace-nowrap cursor-pointer"
+                className="py-3 px-4 rounded-xl bg-[#84A96A] hover:bg-[#95B97B] text-[#0B0F0A] font-bold text-xs flex items-center justify-center gap-2 transition-colors whitespace-nowrap cursor-pointer shadow-lg"
               >
                 {downloadProgressPct !== null ? (
                   <>
-                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <RefreshCw className="w-4 h-4 animate-spin shrink-0" />
                     <span>Saving ({downloadProgressPct}%)...</span>
                   </>
                 ) : (
                   <>
-                    <Download className="w-4 h-4" />
+                    <Download className="w-4 h-4 shrink-0" />
                     <span>Download Watermark-Free</span>
                   </>
                 )}
               </button>
             </div>
 
-            <div className="text-center pt-1">
+            <div className="text-center pt-0.5">
               <button
                 type="button"
                 onClick={() => {
@@ -1621,11 +1758,16 @@ export const WatermarkStudio: React.FC<WatermarkStudioProps> = ({
                     if (cardPlayerVideoRef.current) {
                       cardPlayerVideoRef.current.muted = false;
                       cardPlayerVideoRef.current.volume = 1.0;
-                      cardPlayerVideoRef.current.play().catch(() => {});
+                      cardPlayerVideoRef.current.play().catch(() => {
+                        if (cardPlayerVideoRef.current) {
+                          cardPlayerVideoRef.current.muted = true;
+                          cardPlayerVideoRef.current.play().catch(() => {});
+                        }
+                      });
                     }
                   }, 100);
                 }}
-                className="text-xs text-[#C6E2B1] hover:text-white font-semibold underline underline-offset-4 cursor-pointer"
+                className="text-xs text-[#A3C686] hover:text-white font-semibold underline underline-offset-4 cursor-pointer"
               >
                 Close &amp; Play Inside Studio Card
               </button>
