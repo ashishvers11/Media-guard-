@@ -1,0 +1,6 @@
+{
+  "name": "MediaGuard",
+  "description": "AI-powered photo and video watermark detection and lossless original-quality restoration studio with real-time progress tracking and processing history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
